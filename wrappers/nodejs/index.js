@@ -9,22 +9,34 @@ const EventEmitter = require('events');
 const PNG = require('pngjs').PNG;
 const fs = require('fs');
 
+/**
+ * UnrecoverableError is the type of error that jeopardized the modue that restart
+ * is needed.
+ */
+class UnrecoverableError extends Error {
+  constructor(message) {
+    super('Unrecoverable! '+ message);
+  }
+}
+
 // TODO(tingshao): resolve the potential disabled eslint errors
 /* eslint-disable prefer-rest-params, valid-jsdoc, no-unused-vars, camelcase */
 /**
  * A RealSense camera
  */
 class Device {
-  constructor(dev) {
-    this.cxxDev = dev;
-    this._events = new EventEmitter();
+  constructor(cxxDev, autoDelete = true) {
+    this.cxxDev = cxxDev;
+    if (autoDelete) {
+      internal.addObject(this);
+    }
   }
 
   /**
    * Check if everything is OK, e.g. if the device object is connected to underlying hardware
    * @return {Boolean}
    */
-  isValid() {
+  get isValid() {
     return (this.cxxDev !== null);
   }
 
@@ -40,13 +52,23 @@ class Device {
     sensors.forEach((s) => {
       if (s.isDepthSensor()) {
         array.push(new DepthSensor(s));
-      } else if (s.isROISensor()) {
-        array.push(new ROISensor(s));
       } else {
         array.push(new Sensor(s));
       }
     });
     return array;
+  }
+
+  /**
+   * Get the first sensor
+   * @return {Sensor|undefined}
+   */
+  get first() {
+    let sensors = this.querySensors();
+    if (sensors && sensors.length > 0) {
+      return sensors[0];
+    }
+    return undefined;
   }
 
   /**
@@ -65,12 +87,16 @@ class Device {
    * connected to (platform specific). <br> undefined is not supported.
    * @property {String|undefined} debugOpCode - If device supports firmware logging, this is the
    * command to send to get logs from firmware. <br> undefined is not supported.
-   * @property {String|undefined} advancedMode - True iff the device is in advanced mode.
+   * @property {String|undefined} advancedMode - True if the device is in advanced mode.
    * <br> undefined is not supported.
    * @property {String|undefined} productId - Product ID as reported in the USB descriptor.
    * <br> undefined is not supported.
    * @property {Boolean|undefined} cameraLocked - True if EEPROM is locked. <br> undefined is not
    * supported.
+   * @property {String|undefined} usbTypeDescriptor - Designated USB specification: USB2/USB3.
+   * <br> undefined is not supported.
+   * @property {String|undefined} recommendedFirmwareVersion - Latest firmware version.
+   * <br> undefined is not supported.
    * @see [Device.getCameraInfo()]{@link Device#getCameraInfo}
    */
 
@@ -84,10 +110,12 @@ class Device {
    *
    * @param {String|Integer} [info] - the camera_info type, see {@link camera_info} for available
    * values
-   * @return {CameraInfoObject} if no argument is provided, {CameraInfoObject} is returned.
-   * If a camera_info is provided, the specific camera info value is returned.
+   * @return {CameraInfoObject|String|undefined} if no argument is provided, {CameraInfoObject} is
+   * returned. If a camera_info is provided, the specific camera info value string is returned.
    */
   getCameraInfo(info) {
+    const funcName = 'Device.getCameraInfo()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
     if (arguments.length === 0) {
       let result = {};
       if (this.cxxDev.supportsCameraInfo(camera_info.CAMERA_INFO_NAME)) {
@@ -115,15 +143,18 @@ class Device {
       if (this.cxxDev.supportsCameraInfo(camera_info.CAMERA_INFO_CAMERA_LOCKED)) {
         result.cameraLocked = this.cxxDev.getCameraInfo(camera_info.CAMERA_INFO_CAMERA_LOCKED);
       }
+      if (this.cxxDev.supportsCameraInfo(camera_info.CAMERA_INFO_USB_TYPE_DESCRIPTOR)) {
+        result.usbTypeDescriptor = this.cxxDev.getCameraInfo(
+            camera_info.CAMERA_INFO_USB_TYPE_DESCRIPTOR);
+      }
+      if (this.cxxDev.supportsCameraInfo(camera_info.CAMERA_INFO_RECOMMENDED_FIRMWARE_VERSION)) {
+        result.recommendedFirmwareVersion = this.cxxDev.getCameraInfo(
+            camera_info.CAMERA_INFO_RECOMMENDED_FIRMWARE_VERSION);
+      }
       return result;
     } else {
-      let info = checkStringNumber(arguments[0],
-          constants.camera_info.CAMERA_INFO_NAME,
-          constants.camera_info.CAMERA_INFO_COUNT,
-          cameraInfo2Int,
-          'Device.getCameraInfo(info) expects a number or string as the 1st argument',
-          'Device.getCameraInfo(info) expects a valid value as the 1st argument');
-      return this.cxxDev.getCameraInfo(info);
+      const val = checkArgumentType(arguments, constants.camera_info, 0, funcName);
+      return (this.cxxDev.supportsCameraInfo(val) ? this.cxxDev.getCameraInfo(val) : undefined);
     }
   }
 
@@ -142,15 +173,9 @@ class Device {
    * device.supportsCameraInfo(realsense2.camera_info.CAMERA_INFO_NAME);
    */
   supportsCameraInfo(info) {
-    if (arguments.length !== 1) {
-      throw new TypeError('Device.supportsCameraInfo(info) expects 1 argument');
-    }
-
-    let i = checkStringNumber(arguments[0],
-        constants.camera_info.CAMERA_INFO_NAME, constants.camera_info.CAMERA_INFO_COUNT,
-        cameraInfo2Int,
-        'Device.supportsCameraInfo(info) expects a number or string as the 1st argument',
-        'Device.supportsCameraInfo(info) expects a valid value as the 1st argument');
+    const funcName = 'Device.supportsCameraInfo()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.camera_info, 0, funcName);
     return this.cxxDev.supportsCameraInfo(i);
   }
 
@@ -166,9 +191,78 @@ class Device {
    * Release resources associated with the object
    */
   destroy() {
-    this.cxxDev.destroy();
-    this.cxxDev = undefined;
+    if (this.cxxDev) {
+      this.cxxDev.destroy();
+      this.cxxDev = undefined;
+    }
     this._events = undefined;
+  }
+
+  static _internalCreateDevice(cxxDevice) {
+    return cxxDevice.isTm2() ? new Tm2(cxxDevice) : new Device(cxxDevice);
+  }
+}
+
+/**
+ * This class represents the tm2 device
+ */
+class Tm2 extends Device {
+  constructor(dev) {
+    super(dev);
+  }
+
+  /**
+   * Enter the given device into loopback operation mode that uses the given file as input for
+   * raw data
+   * @param {String} file Path to bag file with raw data for loopback
+   * @return {undefined}
+   */
+  enableLoopback(file) {
+    const funcName = 'Tm2.enableLoopback()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkFileExistence(file);
+    this.cxxDev.enableLoopback(file);
+  }
+
+  /**
+   * Restores the given device into normal operation mode
+   * @return {undefined}
+   */
+  disableLoopback() {
+    this.cxxDev.disableLoopback();
+  }
+
+  /**
+   * Checks if the device is in loopback mode or not
+   * @return {Boolean}
+   */
+  get loopbackEnabled() {
+    return this.cxxDev.isLoopbackEnabled();
+  }
+
+  /**
+   * Connects to a given tm2 controller
+   * @param {ArrayBuffer} macAddress The MAC address of the desired controller
+   * @return {undefined}
+   */
+  connectController(macAddress) {
+    const funcName = 'Tm2.connectController()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'ArrayBuffer', 0, funcName);
+    this.cxxDev.connectController(macAddress);
+  }
+
+  /**
+   * Disconnects a given tm2 controller
+   * @param {Integer} id The ID of the desired controller
+   * @return {undefined}
+   */
+  disconnectController(id) {
+    const funcName = 'Tm2.disconnectController()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'integer', 0, funcName);
+    this.cxxDev.disconnectController(id);
   }
 }
 
@@ -256,12 +350,56 @@ class StreamProfile {
    * @return {ExtrinsicsObject}
    */
   getExtrinsicsTo(toProfile) {
+    const funcName = 'StreamProfile.getExtrinsicsTo()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, StreamProfile, 0, funcName);
     return this.cxxProfile.getExtrinsicsTo(toProfile.cxxProfile);
   }
 
   destroy() {
-    if (this.cxxProfile) this.cxxProfile.destroy();
-    this.cxxProfile = undefined;
+    if (this.cxxProfile) {
+      this.cxxProfile.destroy();
+      this.cxxProfile = undefined;
+    }
+  }
+
+  static _internalCreateStreamProfile(cxxProfile) {
+    if (cxxProfile.isMotionProfile()) {
+      return new MotionStreamProfile(cxxProfile);
+    } else if (cxxProfile.isVideoProfile()) {
+      return new VideoStreamProfile(cxxProfile);
+    } else {
+      return new StreamProfile(cxxProfile);
+    }
+  }
+}
+
+/**
+ * Motion intrinsics: scale, bias, and variances.
+ * @typedef {Object} MotionIntrinsics
+ * @property {Float32[]} data - Array(12), Interpret data array values. Indices are:
+ *   <br>[0 - Scale X, 1 - cross axis, 2 - cross axis, 3 - Bias X,
+ *   <br> 4 - cross axis, 5 - Scale Y, 6 - cross axis, 7 - Bias Y,
+ *   <br> 8 - cross axis, 9 - cross axis, 10 - Scale Z, 11 - Bias Z]
+ * @property {Float32[]} noiseVariances - Array(3), Variance of noise for X, Y, and Z axis
+ * @property {Float32[]} biasVariances - Array(3), Variance of bias for X, Y, and Z axis
+ * @see [MotionStreamProfile.getMotionIntrinsics()]{@link MotionStreamProfile#getMotionIntrinsics}
+ */
+
+/**
+ * This represent the stream profile of motion stream
+ */
+class MotionStreamProfile extends StreamProfile {
+  constructor(cxxProfile) {
+    super(cxxProfile);
+  }
+
+  /**
+   * Returns scale and bias of a motion stream.
+   * @return {MotionIntrinsics} {@link MotionIntrinsics}
+   */
+  getMotionIntrinsics() {
+    return this.cxxProfile.getMotionIntrinsics();
   }
 }
 
@@ -271,14 +409,17 @@ class StreamProfile {
 class DeviceList {
   constructor(cxxList) {
     this.cxxList = cxxList;
+    internal.addObject(this);
   }
 
   /**
    * Release resources associated with the object
    */
   destroy() {
-    this.cxxList.destroy();
-    this.cxxList = undefined;
+    if (this.cxxList) {
+      this.cxxList.destroy();
+      this.cxxList = undefined;
+    }
   }
 
   /**
@@ -288,9 +429,9 @@ class DeviceList {
    * @return {Boolean} true if the camera is contained in the list, otherwise false
    */
   contains(device) {
-    if (!(device instanceof Device)) {
-      throw new TypeError('DeviceList.contains expects a Device object as the argument!');
-    }
+    const funcName = 'DeviceList.contains()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Device, 0, funcName);
     return this.cxxList.contains(device.cxxDev);
   }
 
@@ -302,8 +443,11 @@ class DeviceList {
    * @return {Device|undefined}
    */
   getDevice(index) {
+    const funcName = 'DeviceList.getDevice()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName, 0, this.size);
     let dev = this.cxxList.getDevice(index);
-    return dev ? new Device(dev) : undefined;
+    return dev ? Device._internalCreateDevice(dev) : undefined;
   }
 
   get devices() {
@@ -313,7 +457,7 @@ class DeviceList {
     }
     let output = [];
     for (let i = 0; i < len; i++) {
-      output[i] = new Device(this.cxxList.getDevice(i));
+      output[i] = Device._internalCreateDevice(this.cxxList.getDevice(i));
     }
     return output;
   }
@@ -323,6 +467,25 @@ class DeviceList {
    */
   get size() {
     return this.cxxList.size();
+  }
+
+  /**
+   * Get the first device
+   * @return {Device|undefined}
+   */
+  get front() {
+    return this.getDevice(0);
+  }
+
+  /**
+   * Get the last device
+   * @return {Device|undefined}
+   */
+  get back() {
+    if (this.size > 0) {
+      return this.getDevice(this.size - 1);
+    }
+    return undefined;
   }
 }
 
@@ -375,7 +538,7 @@ class VideoStreamProfile extends StreamProfile {
 
   /**
    * When called on a VideoStreamProfile, returns the intrinsics of specific stream configuration
-   * @return {IntrinsicsObject}
+   * @return {IntrinsicsObject|undefined}
    */
   getIntrinsics() {
     return this.cxxProfile.getVideoStreamIntrinsics();
@@ -386,18 +549,22 @@ class Options {
   constructor(cxxObj) {
     this.cxxObj = cxxObj;
   }
+
+  setCxxOptionsObject(cxxObj) {
+    this.cxxObj = cxxObj;
+  }
   /**
   * Check if particular option is read-only
   * @param {String|Number} option The option to be checked
   * @return {Boolean|undefined} true if option is read-only and undefined if not supported
   */
   isOptionReadOnly(option) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.isOptionReadOnly(option) expects a number or string as the 1st argument',
-        'Sensor.isOptionReadOnly(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o)) return undefined;
+    const funcName = 'Options.isOptionReadOnly()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    if (!this.cxxObj.supportsOption(o)) {
+      return undefined;
+    }
 
     return this.cxxObj.isOptionReadonly(o);
   }
@@ -410,12 +577,12 @@ class Options {
    * @see {@link option}
    */
   getOption(option) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.getOption(option) expects a number or string as the 1st argument',
-        'Sensor.getOption(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o)) return undefined;
+    const funcName = 'Options.getOption()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    if (!this.cxxObj.supportsOption(o)) {
+      return undefined;
+    }
 
     return this.cxxObj.getOption(o);
   }
@@ -444,13 +611,12 @@ class Options {
    * Sensor.getOptionRange(realsense2.option.OPTION_BACKLIGHT_COMPENSATION);
    */
   getOptionRange(option) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.getOptionRange(option) expects a number or string as the 1st argument',
-        'Sensor.getOptionRange(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o)) return undefined;
-
+    const funcName = 'Options.getOptionRange()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    if (!this.cxxObj.supportsOption(o)) {
+      return undefined;
+    }
     return this.cxxObj.getOptionRange(o);
   }
 
@@ -463,13 +629,16 @@ class Options {
    * @return {undefined}
    */
   setOption(option, value) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.getOptionRange(option) expects a number or string as the 1st argument',
-        'Sensor.getOptionRange(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o) || this.cxxObj.isOptionReadonly(o)) return undefined;
-
+    const funcName = 'Options.setOption()';
+    checkArgumentLength(2, 2, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    checkArgumentType(arguments, 'number', 1, funcName);
+    if (!this.cxxObj.supportsOption(o) || this.cxxObj.isOptionReadonly(o)) {
+      return undefined;
+    }
+    if (!this._internalIsOptionValueInRange(o, value)) {
+      return undefined;
+    }
     this.cxxObj.setOption(o, value);
   }
 
@@ -481,11 +650,9 @@ class Options {
    * @see {@link option}
    */
   supportsOption(option) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.supportsOption(option) expects a number or string as the 1st argument',
-        'Sensor.supportsOption(option) expects a valid value as the 1st argument');
+    const funcName = 'Options.supportsOption()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
     return this.cxxObj.supportsOption(o);
   }
 
@@ -498,12 +665,12 @@ class Options {
    * @see {@link option}
    */
   getOptionDescription(option) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.supportsOption(option) expects a number or string as the 1st argument',
-        'Sensor.supportsOption(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o)) return undefined;
+    const funcName = 'Options.getOptionDescription()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    if (!this.cxxObj.supportsOption(o)) {
+      return undefined;
+    }
     return this.cxxObj.getOptionDescription(o);
   }
 
@@ -516,14 +683,19 @@ class Options {
    * @see {@link option}
    */
   getOptionValueDescription(option, value) {
-    let o = checkStringNumber(arguments[0],
-        constants.option.OPTION_BACKLIGHT_COMPENSATION, constants.option.OPTION_COUNT,
-        option2Int,
-        'Sensor.supportsOption(option) expects a number or string as the 1st argument',
-        'Sensor.supportsOption(option) expects a valid value as the 1st argument');
-    if (!this.cxxObj.supportsOption(o)) return undefined;
-
+    const funcName = 'Options.getOptionValueDescription()';
+    checkArgumentLength(2, 2, arguments.length, funcName);
+    const o = checkArgumentType(arguments, constants.option, 0, funcName);
+    checkArgumentType(arguments, 'number', 1, funcName);
+    if (!this.cxxObj.supportsOption(o)) {
+      return undefined;
+    }
     return this.cxxObj.getOptionValueDescription(o, value);
+  }
+
+  _internalIsOptionValueInRange(option, value) {
+    let range = this.getOptionRange(option);
+    return (range && value >= range.minValue && value <= range.maxValue);
   }
 }
 
@@ -533,18 +705,23 @@ class Options {
 class Sensor extends Options {
   /**
    * Construct a Sensor object, representing a RealSense camera subdevice
+   * By default, native resources associated with a Sensor object are freed
+   * automatically during cleanup.
    */
-  constructor(sensor) {
-    super(sensor);
-    this.cxxSensor = sensor;
+  constructor(cxxSensor, autoDelete = true) {
+    super(cxxSensor);
+    this.cxxSensor = cxxSensor;
     this._events = new EventEmitter();
+    if (autoDelete === true) {
+      internal.addObject(this);
+    }
   }
 
   /**
    * Check if everything is OK, e.g. if the device object is connected to underlying hardware
    * @return {Boolean}
    */
-  isValid() {
+  get isValid() {
     return (this.cxxSensor !== null);
   }
 
@@ -555,7 +732,8 @@ class Sensor extends Options {
    *  Syntax 1. open(streamProfile)
    *  Syntax 2. open(profileArray)
    * </code></pre>
-   *  Syntax 2 is for opening multiple profiles in one function call
+   *  Syntax 2 is for opening multiple profiles in one function call and should be used for
+   * interdependent streams, such as depth and infrared, that have to be configured together.
    *
    * @param {StreamProfile} streamProfile configuration commited by the device
    * @param {StreamProfile[]} profileArray configurations array commited by the device
@@ -563,25 +741,49 @@ class Sensor extends Options {
    * stream profiles
    */
   open(streamProfile) {
-    if (arguments.length != 1) {
-      throw new TypeError(
-          'Sensor.open() expects a streamProfile object or an array of streamProfile objects');
-    }
+    const funcName = 'Sensor.open()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
     if (Array.isArray(streamProfile) && streamProfile.length > 0) {
+      let cxxStreamProfiles = [];
       for (let i = 0; i < streamProfile.length; i++) {
         if (!(streamProfile[i] instanceof StreamProfile)) {
           throw new TypeError(
               'Sensor.open() expects a streamProfile object or an array of streamProfile objects'); // eslint-disable-line
         }
+        cxxStreamProfiles.push(streamProfile[i].cxxProfile);
       }
-      this.cxxSensor.openMultipleStream(streamProfile);
+      this.cxxSensor.openMultipleStream(cxxStreamProfiles);
     } else {
-      if (!(streamProfile instanceof StreamProfile)) {
-        throw new TypeError(
-            'Sensor.open() expects a streamProfile object or an array of streamProfile objects'); // eslint-disable-line
-      }
+      checkArgumentType(arguments, StreamProfile, 0, funcName);
       this.cxxSensor.openStream(streamProfile.cxxProfile);
     }
+  }
+
+  /**
+   * Check if specific camera info is supported
+   * @param {String|Integer} info - info type to query. See {@link camera_info} for available values
+   * @return {Boolean|undefined} Returns undefined if an invalid info type was specified.
+   * @see enum {@link camera_info}
+   */
+  supportsCameraInfo(info) {
+    const funcName = 'Sensor.supportsCameraInfo()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.camera_info, 0, funcName);
+    return this.cxxSensor.supportsCameraInfo(i);
+  }
+
+  /**
+   * Get camera information of the sensor
+   *
+   * @param {String|Integer} info - the camera_info type, see {@link camera_info} for available
+   * values
+   * @return {String|undefined}
+   */
+  getCameraInfo(info) {
+    const funcName = 'Sensor.getCameraInfo()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.camera_info, 0, funcName);
+    return (this.cxxSensor.supportsCameraInfo(i) ? this.cxxSensor.getCameraInfo(i) : undefined);
   }
 
   /**
@@ -598,9 +800,11 @@ class Sensor extends Options {
   * @return {undefined} No return value
   */
   destroy() {
-    this.events_ = null;
-    this.cxxSensor.destroy();
-    this.cxxSensor = undefined;
+    this._events = null;
+    if (this.cxxSensor) {
+      this.cxxSensor.destroy();
+      this.cxxSensor = undefined;
+    }
   }
 
   /**
@@ -629,34 +833,47 @@ class Sensor extends Options {
    *
    */
   start(callback) {
-    if (arguments.length != 1) {
-      throw new TypeError('Sensor.start expects 1 argument');
-    }
+    const funcName = 'Sensor.start()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
     if (arguments[0] instanceof Syncer) {
       this.cxxSensor.startWithSyncer(arguments[0].cxxSyncer, false, 0);
     } else {
+      checkArgumentType(arguments, 'function', 0, funcName);
       // create object to hold frames generated from native.
       this.frame = new Frame();
       this.depthFrame = new DepthFrame();
       this.videoFrame = new VideoFrame();
+      this.disparityFrame = new DisparityFrame();
+      this.motionFrame = new MotionFrame();
+      this.poseFrame = new PoseFrame();
 
       let inst = this;
       this.cxxSensor.frameCallback = function() {
         // When the callback is triggered, the underlying frame bas been saved in the objects
         // created above, we need to update it and callback.
-        if (inst.depthFrame.isValid) {
+        if (inst.disparityFrame.isValid) {
+          inst.disparityFrame.updateProfile();
+          callback(inst.disparityFrame);
+        } else if (inst.depthFrame.isValid) {
           inst.depthFrame.updateProfile();
           callback(inst.depthFrame);
         } else if (inst.videoFrame.isValid) {
           inst.videoFrame.updateProfile();
           callback(inst.videoFrame);
+        } else if (inst.motionFrame.isValid) {
+          inst.motionFrame.updateProfile();
+          callback(inst.motionFrame);
+        } else if (inst.poseFrame.isValid) {
+          inst.poseFrame.updateProfile();
+          callback(inst.poseFrame);
         } else {
           inst.frame.updateProfile();
           callback(inst.frame);
         }
       };
       this.cxxSensor.startWithCallback('frameCallback', this.frame.cxxFrame,
-          this.depthFrame.cxxFrame, this.videoFrame.cxxFrame);
+          this.depthFrame.cxxFrame, this.videoFrame.cxxFrame, this.disparityFrame.cxxFrame,
+          this.motionFrame.cxxFrame, this.poseFrame.cxxFrame);
     }
   }
 
@@ -665,7 +882,9 @@ class Sensor extends Options {
    * @return {undefined} No return value
    */
   stop() {
-    this.cxxSensor.stop();
+    if (this.cxxSensor) {
+      this.cxxSensor.stop();
+    }
     if (this.frame) this.frame.release();
     if (this.videoFrame) this.videoFrame.release();
     if (this.depthFrame) this.depthFrame.release();
@@ -677,6 +896,7 @@ class Sensor extends Options {
    * @property {Float}  timestamp - The timestamp of the notification
    * @property {String} severity - The severity of the notification
    * @property {String} category - The category of the notification
+   * @property {String} serializedData - The serialized data of the notification
    */
 
   /**
@@ -687,6 +907,7 @@ class Sensor extends Options {
    * @param {Float}  info.timestamp - See {@link NotificationEventObject} for details
    * @param {String} info.severity - See {@link NotificationEventObject} for details
    * @param {String} info.category - See {@link NotificationEventObject} for details
+   * @param {String} info.serializedData - See {@link NotificationEventObject} for details
    *
    * @see {@link NotificationEventObject}
    * @see [Sensor.setNotificationsCallback()]{@link Sensor#setNotificationsCallback}
@@ -699,6 +920,7 @@ class Sensor extends Options {
    * @param {Float}  evt.timestamp - See {@link NotificationEventObject} for details
    * @param {String} evt.severity - See {@link NotificationEventObject} for details
    * @param {String} evt.category - See {@link NotificationEventObject} for details
+   * @param {String} evt.serializedData - See {@link NotificationEventObject} for details
    * @see {@link NotificationEventObject}
    * @see [Sensor.setNotificationsCallback()]{@link Sensor#setNotificationsCallback}
    */
@@ -711,7 +933,9 @@ class Sensor extends Options {
    * @return {undefined}
    */
   setNotificationsCallback(callback) {
-    if (!callback) return undefined;
+    const funcName = 'Sensor.setNotificationsCallback()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'function', 0, funcName);
 
     this._events.on('notification', (info) => {
       callback(info);
@@ -719,6 +943,10 @@ class Sensor extends Options {
     let inst = this;
     if (!this.cxxSensor.notificationCallback) {
       this.cxxSensor.notificationCallback = function(info) {
+        // convert the severity and category properties from numbers to strings to be
+        // consistent with documentation which are more meaningful to users
+        info.severity = log_severity.logSeverityToString(info.severity);
+        info.category = notification_category.notificationCategoryToString(info.category);
         inst._events.emit('notification', info);
       };
       this.cxxSensor.setNotificationCallback('notificationCallback');
@@ -738,41 +966,10 @@ class Sensor extends Options {
     if (profiles) {
       const array = [];
       profiles.forEach((profile) => {
-        if (profile.isVideoProfile()) {
-          array.push(new VideoStreamProfile(profile));
-        } else {
-          array.push(new StreamProfile(profile));
-        }
+        array.push(StreamProfile._internalCreateStreamProfile(profile));
       });
       return array;
     }
-  }
-
-  /**
-   * Motion Sensor intrinsics: scale, bias, and variances.
-   * @typedef {Object} MotionIntrinsics
-   * @property {Float32[]} data - Array(12), Interpret data array values. Indices are:
-   *   <br>[0 - Scale X, 1 - cross axis, 2 - cross axis, 3 - Bias X,
-   *   <br> 4 - cross axis, 5 - Scale Y, 6 - cross axis, 7 - Bias Y,
-   *   <br> 8 - cross axis, 9 - cross axis, 10 - Scale Z, 11 - Bias Z]
-   * @property {Float32[]} noiseVariances - Array(3), Variance of noise for X, Y, and Z axis
-   * @property {Float32[]} biasVariances - Array(3), Variance of bias for X, Y, and Z axis
-   * @see [Sensor.getMotionIntrinsics()]{@link Sensor#getMotionIntrinsics}
-   */
-
-  /**
-   * Returns scale and bias of a motion stream.
-   * @param {String|Integer} stream - type of stream, see [enum stream]{@link stream} for available
-   * stream value
-   * @return {MotionIntrinsics} {@link MotionIntrinsics}
-   */
-  getMotionIntrinsics(stream) {
-    let s = checkStringNumber(stream,
-        constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-        stream2Int,
-        'Sensor.getMotionIntrinsics() expects a number or string to specify the stream',
-        'Sensor.getMotionIntrinsics() expects a valid value to specify the stream');
-    return this.cxxSensor.getMotionIntrinsics(s);
   }
 }
 
@@ -781,11 +978,26 @@ class Sensor extends Options {
  */
 class ROISensor extends Sensor {
   /**
-   * Construct a ROISensor object, representing a RealSense camera subdevice
-   *
+   * Create a ROISensor out of another sensor
+   * @param {Sensor} sensor a sensor object
+   * @return {ROISensor|undefined} return a ROISensor if the sensor can be
+   * treated as a ROISensor, otherwise return undefined.
    */
-   constructor(sensor) {
-    super(sensor);
+  static from(sensor) {
+    if (sensor.cxxSensor.isROISensor()) {
+      return new ROISensor(sensor.cxxSensor);
+    }
+    return undefined;
+  }
+
+  /**
+   * Construct a ROISensor object, representing a RealSense camera subdevice
+   * The newly created ROISensor object shares native resources with the sensor
+   * argument. So the new object shouldn't be freed automatically to make
+   * sure resources released only once during cleanup.
+   */
+   constructor(cxxSensor) {
+    super(cxxSensor, false);
   }
 
   /**
@@ -826,25 +1038,32 @@ class ROISensor extends Sensor {
    * @param {Float32} maxY - see {@link RegionOfInterestObject} for details.
    */
   setRegionOfInterest(region) {
+    const funcName = 'ROISensor.setRegionOfInterest()';
+    checkArgumentLength(1, 4, arguments.length, funcName);
     let minX;
     let minY;
     let maxX;
     let maxY;
-    if (arguments.length === 1 && typeof region === 'object') {
+    if (arguments.length === 1) {
+      checkArgumentType(arguments, 'object', 0, funcName);
       minX = region.minX;
       minY = region.minY;
       maxX = region.maxX;
       maxY = region.maxY;
-    } else if (arguments.length >= 4) {
+    } else if (arguments.length === 4) {
+      checkArgumentType(arguments, 'number', 0, funcName);
+      checkArgumentType(arguments, 'number', 1, funcName);
+      checkArgumentType(arguments, 'number', 2, funcName);
+      checkArgumentType(arguments, 'number', 3, funcName);
       minX = arguments[0];
       minY = arguments[1];
       maxX = arguments[2];
       maxY = arguments[3];
-      this.cxxSensor.setRegionOfInterest(minX, minY, maxX, maxY);
     } else {
       throw new TypeError(
           'setRegionOfInterest(region) expects a RegionOfInterestObject as argument');
     }
+    this.cxxSensor.setRegionOfInterest(minX, minY, maxX, maxY);
   }
 }
 
@@ -871,12 +1090,35 @@ class DepthSensor extends Sensor {
 
 const internal = {
   ctx: [],
+  objs: [],
+
+  // Register error callback to native code
+  registerErrorCallback: function() {
+    RS2.registerErrorCallback(this, 'errorCallback');
+  },
+
+  // The callback method called from native side
+  errorCallback: function(error) {
+    let msg = 'error native function ' + error.nativeFunction + ': ' + error.description;
+    if (error.recoverable) {
+      throw new Error(msg);
+    }
+    throw new UnrecoverableError(msg);
+  },
 
   addContext: function(c) {
     this.ctx.push(c);
   },
 
+  addObject: function(o) {
+    this.objs.push(o);
+  },
+
   cleanup: function() {
+    this.objs.forEach((obj) => {
+      obj.destroy();
+    });
+    this.objs = [];
     this.ctx.forEach((context) => {
       context.destroy();
     });
@@ -899,21 +1141,32 @@ const internal = {
  * Default librealsense context class,
  */
 class Context {
+  /**
+   * There are only one acceptable form of syntax to create a Context for users:
+   * <pre><code>
+   *  new Context();
+   * </code></pre>
+   * other forms are reserved for internal use only.
+   */
   constructor(cxxCtx) {
+    const funcName = 'Context.constructor()';
+    // Internal code will create Context with cxxObject or other params
+    checkDiscreteArgumentLength([0, 1, 3, 4], arguments.length, funcName);
     this._events = new EventEmitter();
-    if (arguments.length === 1 && arguments[0] === 'no-cxx-context') {
-      // Subclass will do the cxxCtx
+    if (arguments.length === 0) {
+      this.cxxCtx = new RS2.RSContext();
+      this.cxxCtx.create();
+    } else if (arguments.length === 1) {
+      checkArgumentType(arguments, RS2.RSContext, 0, funcName);
+      this.cxxCtx = cxxCtx;
     } else {
-      if (arguments.length === 0) {
-        this.cxxCtx = new RS2.RSContext();
-        this.cxxCtx.create();
-      } else {
-        this.cxxCtx = cxxCtx;
-      }
-
-      this.cxxCtx._events = this._events;
+      checkArgumentType(arguments, 'string', 0, funcName);
+      checkDiscreteArgumentValue(arguments, 0, ['recording', 'playback'], funcName);
+      this.cxxCtx = new (Function.prototype.bind.apply(
+          RS2.RSContext, [null].concat(Array.from(arguments))))();
+      this.cxxCtx.create();
     }
-
+    this.cxxCtx._events = this._events;
     internal.addContext(this);
   }
 
@@ -922,9 +1175,11 @@ class Context {
    * The JavaScript Context object(s) will not be garbage-collected without call(s) to this function
    */
   destroy() {
-    this.cxxCtx.destroy();
-    this.cxxCtx = undefined;
-    internal.cleanupContext();
+    if (this.cxxCtx) {
+      this.cxxCtx.destroy();
+      this.cxxCtx = undefined;
+      internal.cleanupContext();
+    }
   }
 
   /**
@@ -974,11 +1229,15 @@ class Context {
    * @return {Device|undefined}
    */
   getSensorParent(sensor) {
+    const funcName = 'Context.getSensorParent()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Sensor, 0, funcName);
+
     let cxxDev = this.cxxCtx.createDeviceFromSensor(sensor.cxxSensor);
     if (!cxxDev) {
       return undefined;
     }
-    return new Device(cxxDev);
+    return Device._internalCreateDevice(cxxDev);
   }
 
   /**
@@ -1002,7 +1261,9 @@ class Context {
    * @param {devicesChangedCallback} callback - devices changed callback
    */
   setDevicesChangedCallback(callback) {
-    if (!callback) return;
+    const funcName = 'Context.setDevicesChangedCallback()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'function', 0, funcName);
 
     this._events.on('device-changed', (removed, added) => {
       callback(removed, added);
@@ -1022,10 +1283,18 @@ class Context {
    * Create a PlaybackDevice to playback recored data file.
    *
    * @param {String} file - the file path
-   * @return {PlaybackDevice}
+   * @return {PlaybackDevice|undefined}
    */
   loadDevice(file) {
-    return new PlaybackDevice(this.cxxCtx.loadDeviceFile(file));
+    const funcName = 'Context.loadDevice()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkFileExistence(file);
+    const cxxDev = this.cxxCtx.loadDeviceFile(file);
+    if (!cxxDev) {
+      return undefined;
+    }
+    return new PlaybackDevice(cxxDev, true);
   }
 
   /**
@@ -1034,32 +1303,42 @@ class Context {
    * @param {String} file The file name that was loaded to create the playback device
    */
   unloadDevice(file) {
-    // TODO (Shaoting) support this method
+    const funcName = 'Context.unloadDevice()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkFileExistence(file);
+    this.cxxCtx.unloadDeviceFile(file);
   }
 }
 
 /**
- * Record camera data to a disk file
+ * This class is for testing purpose.
+ * It is used to record all operations over librealsense into a file
  * @extends Context
  */
-class RecordContext extends Context {
+class RecordingContext extends Context {
   /**
-   * @param {String} fileName The file name of the recording data
-   * @param {String} section The section name to record
-   * @param {String|Integer} mode Recording mode, default to 'best-quality'
-   *
+   * @param {String} fileName The file name to store the recorded data
+   * @param {String} section The section name within the recording
+   * @param {String|Integer} mode Recording mode, default to 'blank-frames'
    * @see [enum recording_mode]{@link recording_mode}
    */
-  constructor(fileName, section, mode = 'best-quality') {
-    super('no-cxx-context');
-    // TODO: create this.cxxCtx in child class
-    // this.cxxCtx = ...
-    this.cxxCtx._events = this._events;
+  constructor(fileName, section = '', mode = 'blank-frames') {
+    const funcName = 'RecordingContext.constructor()';
+    checkArgumentLength(1, 3, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkArgumentType(arguments, 'string', 1, funcName);
+    let m = checkArgumentType(arguments, constants.recording_mode, 2, funcName);
+    m = (m === undefined ? recordingMode2Int(mode) : m);
+    super('recording', fileName, section, m);
   }
 }
 
 /**
- * Playback camera recordings
+ * This class is for testing purpose.
+ * It is used to reproduce the same responses for the same operations as
+ * recording. The user must call the same methods as recorded in the file
+ * to get correct response.
  * @extends Context
  */
 class PlaybackContext extends Context {
@@ -1067,36 +1346,364 @@ class PlaybackContext extends Context {
    * @param {String} fileName The file name of the recording
    * @param {String} section The section name used in recording
    */
-  constructor(fileName = '', section = '') {
-    super('no-cxx-context');
-    // TODO: create this.cxxCtx in child class
-    // this.cxxCtx = ...
-    this.cxxCtx._events = this._events;
+  constructor(fileName, section = '') {
+    const funcName = 'PlaybackContext.constructor()';
+    checkArgumentLength(1, 2, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkArgumentType(arguments, 'string', 1, funcName);
+    checkFileExistence(fileName);
+    super('playback', fileName, section);
   }
 }
 
-class RecordDevice extends Device {
-  constructor(file, cxxDevice) {
-    super(cxxDevice);
-    this.file = file;
+/**
+ * This class provides the ability to record a live session of streaming to a file
+ *
+ * There are 2 ways for users to create a RecorderDevice:
+ * <pre><code>
+ *  Syntax 1. RecorderDevice.from(device);
+ *  Syntax 2. new RecorderDevice(file, device);
+ * </code></pre>
+ *
+ * Syntax 1 can only be applied to device that can be converted to RecorderDevice, see
+ * below example:
+ * <pre><code>
+ *  const file = 'record.bag';
+ *  let cfg = new rs2.Config();
+ *  cfg.enableRecordToFile(file);
+ *  let pipe = new rs2.Pipeline();
+ *  pipe.start(cfg);
+ *  let device = pipe.getActiveProfile().getDevice();
+ *  let recorder = rs2.RecorderDevice.from(device);
+ *
+ *  // record 10 frames.
+ *  for (let i = 0; i < 10; i++) {
+ *    let frames = pipe.waitForFrames();
+ *  }
+ *
+ *  pipe.stop();
+ *  // cleanup and make sure the recorded frames are flushed to file
+ *  rs2.cleanup();
+ * </code></pre>
+ *
+ * Syntax 2 is to create a RecorderDevice from a live device, see below example:
+ * <pre><code>
+ *  let ctx = new rs2.Context();
+ *  let dev = ctx.queryDevices().devices[0];
+ *  // record to file record.bag
+ *  let recorder = new rs2.RecorderDevice('record.bag', dev);
+ *  let sensors = recorder.querySensors();
+ *  let sensor = sensors[0];
+ *  let profiles = sensor.getStreamProfiles();
+ *
+ *  for (let i =0; i < profiles.length; i++) {
+ *    if (profiles[i].streamType === rs2.stream.STREAM_DEPTH &&
+ *        profiles[i].fps === 30 &&
+ *        profiles[i].width === 640 &&
+ *        profiles[i].height === 480 &&
+ *        profiles[i].format === rs2.format.FORMAT_Z16) {
+ *      sensor.open(profiles[i]);
+ *    }
+ *  }
+ *
+ *  // record 10 frames
+ *  let cnt = 0;
+ *  sensor.start((frame) => {
+ *    cnt++;
+ *    if (cnt === 10) {
+ *      // stop recording
+ *      recorder.reset();
+ *      rs2.cleanup();
+ *      console.log('Recorded ', cnt, ' frames');
+ *    }
+ *  })
+ * </code></pre>
+ * @extends Device
+ */
+class RecorderDevice extends Device {
+  /**
+   * Create a RecorderDevice from another device
+   *
+   * @param {Device} device another existing device
+   * @return {RecorderDevice|undefined} If the the input device can be
+   * converted to a RecorderDevice, return the newly created RecorderDevice,
+   * otherwise, undefined is returned.
+   */
+  static from(device) {
+    return device.cxxDev.isRecorder() ?
+        new RecorderDevice(null, null, device.cxxDev, false) : undefined;
+  }
+
+  /**
+   * @param {String} file the file name to store the recorded data
+   * @param {Device} device the actual device to be recorded
+   */
+  constructor(file, device, cxxDev = undefined, autoDelete = true) {
+    const funcName = 'RecorderDevice.constructor()';
+    checkArgumentLength(2, 4, arguments.length, funcName);
+    if (arguments[0] && arguments[1]) {
+      checkArgumentType(arguments, 'string', 0, funcName);
+      checkArgumentType(arguments, Device, 1, funcName);
+    } else if (arguments[2]) {
+      checkArgumentType(arguments, 'object', 2, funcName);
+      checkArgumentType(arguments, 'boolean', 3, funcName);
+    } else {
+      throw new TypeError('Invalid parameters for new RecorderDevice()');
+    }
+    super(cxxDev ? cxxDev : device.cxxDev.spawnRecorderDevice(file), autoDelete);
+  }
+  /**
+   * Pause the recording device without stopping the actual device from streaming.
+   */
+  pause() {
+    this.cxxDev.pauseRecord();
+  }
+  /**
+   * Resume the recording
+   */
+  resume() {
+    this.cxxDev.resumeRecord();
+  }
+  /**
+   * Gets the name of the file to which the recorder is writing
+   * @return {String}
+   */
+  get fileName() {
+    return this.cxxDev.getFileName();
   }
 }
 
+/**
+ * This class is used to playback the file recorded by RecorderDevice
+ * There are 2 ways for users to create a PlaybackDevice:
+ * <pre><code>
+ *  Syntax 1: PlaybackDevice.from(device)
+ *  Syntax 2: Context.loadDevice(filePath)
+ * </code></pre>
+ *
+ * Syntax 1 is to convert an existing device to a PlaybackDevice which can only be
+ * applied to device that can be converted. Here is an example:
+ * <pre><code>
+ *  const file = 'record.bag';
+ *  let cfg = new rs2.Config();
+ *  cfg.enableDeviceFromFile(file);
+ *  let pipe = new rs2.Pipeline();
+ *  pipe.start(cfg);
+ *  let device = pipe.getActiveProfile().getDevice();
+ *  let playback = rs2.PlaybackDevice.from(device);
+ *
+ *  for (let i = 0; i < 10; i++) {
+ *    let frames = pipe.waitForFrames();
+ *  }
+ *
+ *  pipe.stop();
+ *  rs2.cleanup();
+ * </code></pre>
+ *
+ * Syntax 2 is to create a PlaybackDevice through Context. Here is an example:
+ * <pre><code>
+ *  let ctx = new rs2.Context();
+ *  // load the recorded file
+ *  let dev = ctx.loadDevice('record.bag');
+ *  let sensors = dev.querySensors();
+ *  let sensor = sensors[0];
+ *  let profiles = sensor.getStreamProfiles();
+ *  let cnt = 0;
+ *
+ *  // when received 'stopped' status, stop playback
+ *  dev.setStatusChangedCallback((status) => {
+ *    console.log('playback status: ', status);
+ *    if (status.description === 'stopped') {
+ *      dev.stop();
+ *      ctx.unloadDevice('record.bag');
+ *      rs2.cleanup();
+ *      console.log('Playback ', cnt, ' frames');
+ *    }
+ *  });
+ *
+ *  // start playback
+ *  sensor.open(profiles);
+ *  sensor.start((frame) => {
+ *    cnt ++;
+ *  });
+ * </code></pre>
+ * @extends Device
+ * @see [Context.loadDevice]{@link Context#loadDevice}
+ */
 class PlaybackDevice extends Device {
-  constructor(file, cxxDevice) {
-    super(cxxDevice);
-    this.file = file;
+  /**
+   * Create a PlaybackDevice from another device
+   *
+   * @param {Device} device another existing device that can be converted to a
+   * PlaybackDevice
+   * @return {PlaybackDevice|undefined} If the the input device can be
+   * converted to a PlaybackDevice, return the newly created PlaybackDevice,
+   * otherwise, undefined is returned.
+   */
+  static from(device) {
+    return device.cxxDev.isPlayback() ?
+        new PlaybackDevice(device.cxxDev, false) : undefined;
+  }
+
+  constructor(cxxdevice, autoDelete) {
+    super(cxxdevice, autoDelete);
+    this._events = new EventEmitter();
+  }
+  /**
+   * Pauses the playback
+   * Calling pause() in "paused" status does nothing
+   * If pause() is called while playback status is "playing" or "stopped", the playback will not
+   * play until resume() is called
+   * @return {undefined}
+   */
+  pause() {
+    this.cxxDev.pausePlayback();
+  }
+  /**
+   * Resumes the playback
+   * Calling resume() while playback status is "playing" or "stopped" does nothing
+   * @return {undefined}
+   */
+  resume() {
+    this.cxxDev.resumePlayback();
+  }
+  /**
+   * Stops playback
+   * @return {undefined}
+   */
+  stop() {
+    this.cxxDev.stopPlayback();
+  }
+  /**
+   * Retrieves the name of the playback file
+   * @return {String}
+   */
+  get fileName() {
+    return this.cxxDev.getFileName();
+  }
+  /**
+   * Retrieves the current position of the playback in the file in terms of time. Unit is
+   * millisecond
+   * @return {Integer}
+   */
+  get position() {
+    return this.cxxDev.getPosition();
+  }
+  /**
+   * Retrieves the total duration of the file, unit is millisecond.
+   * @return {Integer}
+   */
+  get duration() {
+    return this.cxxDev.getDuration();
+  }
+  /**
+   * Sets the playback to a specified time point of the played data
+   * @param {time} time the target time to seek to, unit is millisecond
+   * @return {undefined}
+   */
+  seek(time) {
+    const funcName = 'PlaybackDevice.seek()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName);
+    this.cxxDev.seek(time);
+  }
+  /**
+   * Indicates if playback is in real time mode or non real time
+   * In real time mode, playback will play the same way the file was recorded. If the application
+   * takes too long to handle the callback, frames may be dropped.
+   * In non real time mode, playback will wait for each callback to finish handling the data before
+   * reading the next frame. In this mode no frames will be dropped, and the application controls
+   * the frame rate of the playback (according to the callback handler duration).
+   * @return {Boolean}
+   */
+  get isRealTime() {
+    return this.cxxDev.isRealTime();
+  }
+  /**
+   * Set the playback to work in real time or non real time
+   * @param {boolean} val whether real time mode is used
+   * @return {undefined}
+   */
+  set isRealTime(val) {
+    const funcName = 'PlaybackDevice.isRealTime()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'boolean', 0, funcName);
+    this.cxxDev.setIsRealTime(val);
+  }
+  /**
+   * Set the playing speed
+   * @param {Float} speed indicates a multiplication of the speed to play (e.g: 1 = normal,
+   * 0.5 half normal speed)
+   */
+  setPlaybackSpeed(speed) {
+    const funcName = 'PlaybackDevice.setPlaybackSpeed()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName);
+    this.cxxDev.setPlaybackSpeed(speed);
+  }
+
+  /**
+   * @typedef {Object} PlaybackStatusObject
+   * @property {Integer} status - The status of the notification, see {@link playback_status}
+   * for details
+   * @property {String} description - The human readable literal description of the status
+   */
+
+  /**
+   * This callback is called when the status of the playback device changed
+   * @callback StatusChangedCallback
+   * @param {PlaybackStatusObject} status
+   *
+   * @see [PlaybackDevice.setStatusChangedCallback]{@link PlaybackDevice#setStatusChangedCallback}
+   */
+
+  /**
+   * Returns the current state of the playback device
+   * @return {PlaybackStatusObject}
+   */
+  get currentStatus() {
+    let cxxStatus = this.cxxDev.getCurrentStatus();
+    if (!cxxStatus) {
+      return undefined;
+    }
+    return {status: cxxStatus, description: playback_status.playbackStatusToString(cxxStatus)};
+  }
+
+  /**
+   * Register a callback to receive the playback device's status changes
+   * @param {StatusChangedCallback} callback the callback method
+   * @return {undefined}
+   */
+  setStatusChangedCallback(callback) {
+    const funcName = 'PlaybackDevice.setStatusChangedCallback()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'function', 0, funcName);
+    this._events.on('status-changed', (status) => {
+      callback({status: status, description: playback_status.playbackStatusToString(status)});
+    });
+    let inst = this;
+    if (!this.cxxDev.statusChangedCallback) {
+      this.cxxDev.statusChangedCallback = (status) => {
+        inst._events.emit('status-changed', status);
+      };
+      this.cxxDev.setStatusChangedCallbackMethodName('statusChangedCallback');
+    }
   }
 }
+
+internal.RecordingContext = RecordingContext;
+internal.PlaybackContext = PlaybackContext;
 
 /**
  * PointCloud accepts depth frames and outputs Points frames
  * In addition, given non-depth frame, the block will align texture coordinate to the non-depth
  * stream
  */
-class PointCloud {
+class PointCloud extends Options {
   constructor() {
+    super();
     this.cxxPointCloud = new RS2.RSPointCloud();
+    this.setCxxOptionsObject(this.cxxPointCloud);
     this.pointsFrame = new Points();
   }
 
@@ -1106,14 +1713,14 @@ class PointCloud {
    * @return {Points|undefined}
    */
   calculate(depthFrame) {
-    if (arguments.length === 1 && depthFrame && depthFrame instanceof DepthFrame) {
-      this.pointsFrame.release();
-      if (this.cxxPointCloud.calculate(depthFrame.cxxFrame, this.pointsFrame.cxxFrame)) {
-        return this.pointsFrame;
-      }
-      return undefined;
+    const funcName = 'PointCloud.calculate()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, DepthFrame, 0, funcName);
+    this.pointsFrame.release();
+    if (this.cxxPointCloud.calculate(depthFrame.cxxFrame, this.pointsFrame.cxxFrame)) {
+      return this.pointsFrame;
     }
-    throw new TypeError('PointCloud.calculate() expects a frame argument.');
+    return undefined;
   }
 
   /**
@@ -1122,11 +1729,10 @@ class PointCloud {
    * @return {undefined}
    */
   mapTo(mappedFrame) {
-    if (mappedFrame) {
-      this.cxxPointCloud.mapTo(mappedFrame.cxxFrame);
-    } else {
-      throw new TypeError('PointCloud.mapTo() expects a frame argument');
-    }
+    const funcName = 'PointCloud.mapTo()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Frame, 0, funcName);
+    this.cxxPointCloud.mapTo(mappedFrame.cxxFrame);
   }
 
   release() {
@@ -1147,10 +1753,12 @@ class PointCloud {
 /**
  * The Colorizer can be used to quickly visualize the depth data by tranform data into RGB8 format
  */
-class Colorizer {
+class Colorizer extends Options {
   constructor() {
+    super();
     this.cxxColorizer = new RS2.RSColorizer();
     this.cxxColorizer.create();
+    this.setCxxOptionsObject(this.cxxColorizer);
     this.depthRGB = new VideoFrame();
   }
 
@@ -1179,42 +1787,51 @@ class Colorizer {
    * @return {VideoFrame|undefined}
    */
   colorize(depthFrame) {
-    if (arguments.length === 1 && depthFrame instanceof DepthFrame) {
-      const success = this.cxxColorizer.colorize(depthFrame.cxxFrame, this.depthRGB.cxxFrame);
-      this.depthRGB.updateProfile();
-      return success ? this.depthRGB : undefined;
-    } else {
-      throw new TypeError('Colorizer.colorize() expects a frame argument');
-    }
+    const funcName = 'Colorizer.colorize()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    // Though depth frame is expected, color frame could also be processed, so
+    // only check whether the type is Frame
+    checkArgumentType(arguments, Frame, 0, funcName);
+    const success = this.cxxColorizer.colorize(depthFrame.cxxFrame, this.depthRGB.cxxFrame);
+    this.depthRGB.updateProfile();
+    return success ? this.depthRGB : undefined;
   }
 }
 
 /**
- * The Align allows to perform aliment of depth frames to other frames
+ * This class can be used to perform alignment between a depth frame and another frame.
  */
 class Align {
+  /**
+   * @param {Integer|String} stream the stream type to be aligned to. see {@link stream} for
+   * avaiable values. To perform alignment of a depth frame to the other frame, set the stream
+   * argument to the other stream type. To perform alignment of a non depth frame to a depth frame,
+   * set the stream argument to stream type of depth.
+   */
   constructor(stream) {
-    let s = checkStringNumber(stream,
-            constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-            stream2Int,
-            'Align constructor expects a string or an integer argument',
-            'Align constructor\'s argument value is invalid');
-
+    const funcName = 'Align.constructor()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const s = checkArgumentType(arguments, constants.stream, 0, funcName);
     this.cxxAlign = new RS2.RSAlign(s);
     this.frameSet = new FrameSet();
+    internal.addObject(this);
   }
 
+  /**
+   * Run the alignment process on the given frameset to get an aligned set of frames
+   * @param {FrameSet} frameSet the frames which at least has a depth frame
+   * @return {FrameSet}
+   */
   process(frameSet) {
-    if (arguments.length === 1 && frameSet) {
-      this.frameSet.release(); // Destroy all attached-frames (depth/color/etc.)
-      if (this.cxxAlign.process(frameSet.cxxFrameSet, this.frameSet.cxxFrameSet)) {
-        this.frameSet.__update();
-        return this.frameSet;
-      }
-      return undefined;
+    const funcName = 'Align.process()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, FrameSet, 0, funcName);
+    this.frameSet.release(); // Destroy all attached-frames (depth/color/etc.)
+    if (this.cxxAlign.process(frameSet.cxxFrameSet, this.frameSet.cxxFrameSet)) {
+      this.frameSet.__update();
+      return this.frameSet;
     }
-
-    throw new TypeError('Align.process() expects a frameset argument');
+    return undefined;
   }
 
   release() {
@@ -1247,16 +1864,22 @@ class Align {
  * @property {Number} timestamp - The timestamp of the frame.
  * @property {Integer} streamType - The stream type of the frame.
  * see <code>enum {@link stream}</code>
- * @property {Integer} dataByteLength - Get the byte length of the buffer data.
- * @property {Integer} strideInBytes - The stride of the frame. The unit is number of bytes.
  * @property {Integer} bitsPerPixel - The number of bits per pixel
- * @property {string} timestampDomain - Get the domain (clock name) of timestamp value.
- *
+ * @property {Integer} timestampDomain - Get the domain (clock name) of timestamp value.
  */
 class Frame {
   constructor(cxxFrame) {
     this.cxxFrame = cxxFrame || new RS2.RSFrame();
     this.updateProfile();
+    internal.addObject(this);
+    // called from native to reset this.arrayBuffer and this.typedArray when the
+    // underlying frame was replaced. The arrayBuffer and typedArray must be reset
+    // to avoid deprecated data to be used.
+    const jsWrapper = this;
+    this.cxxFrame._internalResetBuffer = function() {
+      jsWrapper.typedArray = undefined;
+      jsWrapper.arrayBuffer = undefined;
+    };
   }
 
   updateProfile() {
@@ -1264,8 +1887,7 @@ class Frame {
     if (this.cxxFrame) {
       let cxxProfile = this.cxxFrame.getStreamProfile();
       if (cxxProfile) {
-        this.streamProfile = cxxProfile.isVideoProfile ?
-            new VideoStreamProfile(cxxProfile) : new StreamProfile(cxxProfile);
+        this.streamProfile = StreamProfile._internalCreateStreamProfile(cxxProfile);
       }
     }
   }
@@ -1299,7 +1921,7 @@ class Frame {
    * @return {Integer} see {@link stream} for avaiable values
    */
   get streamType() {
-    return this.streamProfile.stream;
+    return this.streamProfile.streamType;
   }
 
   get profile() {
@@ -1349,13 +1971,10 @@ class Frame {
    * @return {Uint8Array} The metadata value, 8 bytes, byte order is bigendian.
    */
   frameMetadata(metadata) {
-    let m = checkStringNumber(metadata,
-        constants.frame_metadata.FRAME_METADATA_FRAME_COUNTER,
-        constants.frame_metadata.FRAME_METADATA_COUNT,
-        frameMetadata2Int,
-        'Frame.frameMetadata(metadata) expects a number or string as the 1st argument',
-        'Frame.frameMetadata(metadata) expects a valid value as the 1st argument');
-    let array = new Uint8Array(8);
+    const funcName = 'Frame.frameMetadata()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const m = checkArgumentType(arguments, constants.frame_metadata, 0, funcName);
+    const array = new Uint8Array(8);
     return this.cxxFrame.getFrameMetadata(m, array) ? array : undefined;
   }
 
@@ -1365,12 +1984,9 @@ class Frame {
    * @return {Boolean} true if supported, and false if not
    */
   supportsFrameMetadata(metadata) {
-    let m = checkStringNumber(metadata,
-        constants.frame_metadata.FRAME_METADATA_FRAME_COUNTER,
-        constants.frame_metadata.FRAME_METADATA_COUNT,
-        frameMetadata2Int,
-        'Frame.supportsFrameMetadata(metadata) expects a number or string as the 1st argument',
-        'Frame.supportsFrameMetadata(metadata) expects a valid value as the 1st argument');
+    const funcName = 'Frame.supportsFrameMetadata()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const m = checkArgumentType(arguments, constants.frame_metadata, 0, funcName);
     return this.cxxFrame.supportsFrameMetadata(m);
   }
 
@@ -1423,6 +2039,8 @@ class Frame {
         return this.typedArray;
       case constants.format.FORMAT_XYZ32F:
       case constants.format.FORMAT_MOTION_XYZ32F:
+      case constants.format.FORMAT_6DOF:
+      case constants.format.FORMAT_DISPARITY32:
         this.typedArray = new Float32Array(this.arrayBuffer);
         return this.typedArray;
     }
@@ -1442,33 +2060,39 @@ class Frame {
    *   see {@link Frame#data};
    *  if syntax 2 is used, return value is not used (<code>undefined</code>).
    *
-   * @see [Frame.dataByteLength]{@link Frame#dataByteLength} to determine the buffer size in bytes.
+   * @see [VideoFrame.dataByteLength]{@link VideoFrame#dataByteLength} to determine the buffer size
+   * in bytes.
    */
   getData(buffer) {
-    if (arguments.length === 0) return this.data;
-
-    if (arguments.length === 1 && isArrayBuffer(buffer)) {
+    const funcName = 'Frame.supportsFrameMetadata()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
+    if (arguments.length === 0) {
+      return this.data;
+    } else if (arguments.length === 1) {
+      checkArgumentType(arguments, 'ArrayBuffer', 0, funcName);
       return this.cxxFrame.writeData(buffer);
     }
-
-    throw new TypeError('Frame.getData() expects 1 ArrayBuffer as a argument, or no argument');
   }
 
   /**
-   * Get the data length in bytes
-   * @return {Integer}
+   * communicate to the library you intend to keep the frame alive for a while
+   * this will remove the frame from the regular count of the frame pool
+   * once this function is called, the SDK can no longer guarantee 0-allocations during frame
+   * cycling
+   * @return {undefined}
    */
-  get dataByteLength() {
-    return this.strideInBytes * this.height;
+  keep() {
+    this.cxxFrame.keep();
   }
 
-  /**
-   * Retrieve frame stride, meaning the actual line width in memory in bytes (not the logical image
-   * width)
-   * @return {Integer}
-   */
-  get strideInBytes() {
-    return this.cxxFrame.getStrideInBytes();
+  static _internalCreateFrame(cxxFrame) {
+    if (!cxxFrame) return undefined;
+    if (cxxFrame.isPoseFrame()) return new PoseFrame(cxxFrame);
+    if (cxxFrame.isMotionFrame()) return new MotionFrame(cxxFrame);
+    if (cxxFrame.isDisparityFrame()) return new DisparityFrame(cxxFrame);
+    if (cxxFrame.isDepthFrame()) return new DepthFrame(cxxFrame);
+    if (cxxFrame.isVideoFrame()) return new VideoFrame(cxxFrame);
+    return new Frame(cxxFrame);
   }
 }
 
@@ -1477,10 +2101,10 @@ class Frame {
  *
  * @property {Integer} width - The image width in pixels.
  * @property {Integer} height - The image height in pixels.
+ * @property {Integer} dataByteLength - The length in bytes
  * @property {Integer} strideInBytes - The stride of the frame. The unit is number of bytes.
  * @property {Integer} bitsPerPixel - The number of bits per pixel
- * @property {string} timestampDomain - Get the domain (clock name) of timestamp value.
- *
+ * @property {Integer} bytesPerPixel - The number of bytes per pixel
  */
 class VideoFrame extends Frame {
   constructor(frame) {
@@ -1504,7 +2128,23 @@ class VideoFrame extends Frame {
   }
 
   /**
-   * Retrieve bits per pixel
+   * Get the data length in bytes
+   * @return {Integer}
+   */
+  get dataByteLength() {
+    return this.strideInBytes * this.height;
+  }
+
+  /**
+   * Retrieve frame stride, the actual line width in bytes (not the logical image width)
+   * @return {Integer}
+   */
+  get strideInBytes() {
+    return this.cxxFrame.getStrideInBytes();
+  }
+
+  /**
+   * Retrieve count of bits per pixel
    * @return {Integer}
    */
   get bitsPerPixel() {
@@ -1564,6 +2204,22 @@ class Points extends Frame {
   }
 
   /**
+   * Creates a ply file of the model with the given file name.
+   * @param {String} fileName name of the ply file
+   * @param {VideoFrame} texture texture frame
+   * @return {undefined}
+   */
+  exportToPly(fileName, texture) {
+    const funcName = 'Points.exportToPly()';
+    checkArgumentLength(2, 2, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkArgumentType(arguments, VideoFrame, 1, funcName);
+    if (this.cxxFrame) {
+      this.cxxFrame.exportToPly(fileName, texture.cxxFrame);
+    }
+  }
+
+  /**
    * Get an array of texture coordinates per vertex
    * Each coordinate represent a (u,v) pair within [0,1] range, to be mapped to texture image
    *
@@ -1614,11 +2270,111 @@ class DepthFrame extends VideoFrame {
    * @return {Float}
    */
   getDistance(x, y) {
-    if ((arguments.length != 2) || (typeof x !== 'number') || (typeof y !== 'number')) {
-      throw new TypeError('DepthFrame.getDistance(x, y) expects 2 integer arguments.');
-    }
-
+    const funcName = 'DepthFrame.getDistance()';
+    checkArgumentLength(2, 2, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName);
+    checkArgumentType(arguments, 'number', 1, funcName);
     return this.cxxFrame.getDistance(x, y);
+  }
+}
+
+/**
+ * Disparity Frame
+ */
+class DisparityFrame extends DepthFrame {
+  constructor(cxxFrame) {
+    super(cxxFrame);
+  }
+
+  /**
+   * Retrieve the stereoscopic baseline value. Applicable to stereo-based depth modules
+   * @return {Float} Stereoscopic baseline in millimeters
+   */
+  get baseLine() {
+    return this.cxxFrame.getBaseLine();
+  }
+}
+
+/**
+ * 3D vector in Euclidean coordinate space
+ * @typedef {Object} Vector
+ * @property {Float32} x - value of x coordinate
+ * @property {Float32} y - value of y coordinate
+ * @property {Float32} z - value of z coordinate
+ * @see [MotionFrame.getMotionData()]{@link MotionFrame#getMotionData}
+ */
+
+/**
+ * Quaternion used to represent rotation
+ * @typedef {Object} Quaternion
+ * @property {Float32} x
+ * @property {Float32} y
+ * @property {Float32} z
+ * @property {Float32} w
+ * @see [PoseFrame.getPoseData()]{@link PoseFrame#getPoseData}
+ */
+
+/**
+ * This class resprents a motion frame and is a subclass of Frame
+ */
+class MotionFrame extends Frame {
+  constructor(frame) {
+    super(frame);
+    this._motion = {x: 0, y: 0, z: 0};
+  }
+
+  /**
+   * Get the motion data
+   * @return {Vector} the motion data on x, y and z coordinates
+   */
+  get motionData() {
+    this.cxxFrame.getMotionData(this._motion);
+    return this._motion;
+  }
+}
+
+/**
+ * PoseData
+ * @typedef {Object} PoseData
+ * @property {Vector} translation - X, Y, Z values of translation, in meters (relative to
+ * initial position)
+ * @property {Vector} velocity - X, Y, Z values of velocity, in meter/sec
+ * @property {Vector} acceleration - X, Y, Z values of acceleration, in meter/sec^2
+ * @property {Quaternion} rotation - Qi, Qj, Qk, Qr components of rotation as represented
+ * in quaternion rotation (relative to initial position)
+ * @property {Vector} angularVelocity - X, Y, Z values of angular velocity, in radians/sec
+ * @property {Vector} angularAcceleration - X, Y, Z values of angular acceleration, in radians/sec^2
+ * @property {Integer} trackerConfidence - pose data confidence 0 - Failed, 1 - Low, 2 - Medium,
+ * 3 - High
+ * @property {Integer} mapperConfidence - pose data confidence 0 - Failed, 1 - Low, 2 - Medium,
+ * 3 - High
+ * @see [PoseFrame.getPoseData()]{@link PoseFrame#getPoseData}
+ */
+
+/**
+ * This class resprents a pose frame and is a subclass of Frame
+ */
+class PoseFrame extends Frame {
+  constructor(frame) {
+    super(frame);
+    this._pose = {
+      translation: {x: 0, y: 0, z: 0},
+      velocity: {x: 0, y: 0, z: 0},
+      acceleration: {x: 0, y: 0, z: 0},
+      rotation: {x: 0, y: 0, z: 0, w: 0},
+      angularVelocity: {x: 0, y: 0, z: 0},
+      angularAcceleration: {x: 0, y: 0, z: 0},
+      trackerConfidence: 0,
+      mapperConfidence: 0,
+    };
+  }
+
+  /**
+   * Get the pose data
+   * @return {PoseData|undefined}
+   */
+  get poseData() {
+    return (this.cxxFrame.getPoseData(this._pose)) ? this._pose : undefined;
   }
 }
 
@@ -1633,6 +2389,7 @@ class FrameSet {
   constructor(cxxFrameSet) {
     this.cxxFrameSet = cxxFrameSet || new RS2.RSFrameSet();
     this.cache = [];
+    this.cacheMetadata = [];
     this.__update();
   }
 
@@ -1651,7 +2408,7 @@ class FrameSet {
    * @return {DepthFrame|undefined}
    */
   get depthFrame() {
-    return this.getFrame(stream.STREAM_DEPTH);
+    return this.getFrame(stream.STREAM_DEPTH, 0);
   }
 
   /**
@@ -1660,75 +2417,118 @@ class FrameSet {
    * @return {VideoFrame|undefined}
    */
   get colorFrame() {
-    return this.getFrame(stream.STREAM_COLOR);
+    return this.getFrame(stream.STREAM_COLOR, 0);
+  }
+
+  /**
+   * Get the infrared frame
+   * @param {Integer} streamIndex index of the expected infrared stream
+   * @return {VideoFrame|undefined}
+   */
+  getInfraredFrame(streamIndex = 0) {
+    const funcName = 'FrameSet.getInfraredFrame()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
+    if (arguments.length === 1) {
+      checkArgumentType(arguments, 'integer', 0, funcName);
+    }
+    return this.getFrame(stream.STREAM_INFRARED, streamIndex);
   }
 
   /**
    * Get the frame at specified index
    *
-   * @param {Integer} index the index of the expected frame
+   * @param {Integer} index the index of the expected frame (Note: this is not
+   * stream index)
    * @return {DepthFrame|VideoFrame|Frame|undefined}
    */
   at(index) {
-    //
-    // TODO(ting): mapping index to stream and use this.cache[]
-    //   e.g. return getFrame(this.cxxFrameSet.indexToStream(index));
-    //
+    const funcName = 'FrameSet.at()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName, 0, this.size);
+    return this.getFrame(this.cxxFrameSet.indexToStream(index),
+        this.cxxFrameSet.indexToStreamIndex(index));
+  }
 
-    let cxxFrame = this.cxxFrameSet.at(index);
+  /**
+   * Run the provided callback function with each Frame inside the FrameSet
+   * @param {FrameCallback} callback the callback function to process each frame
+   * @return {undefined}
+   */
+  forEach(callback) {
+    const funcName = 'FrameSet.forEach()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'function', 0, funcName);
+    const size = this.size;
+    for (let i = 0; i < size; i++) {
+      callback(this.at(i));
+    }
+  }
 
-    if (!cxxFrame) return undefined;
+  __internalGetFrame(stream, streamIndex) {
+    let cxxFrame = this.cxxFrameSet.getFrame(stream, streamIndex);
+    return (cxxFrame ? Frame._internalCreateFrame(cxxFrame) : undefined);
+  }
 
-    if (cxxFrame.isDepthFrame()) {
-      return new DepthFrame(cxxFrame);
+  __internalFindFrameInCache(stream, streamIndex) {
+    if (stream === stream.STREAM_ANY) {
+      return (this.cacheMetadata.size ? 0 : undefined);
     }
 
-    if (cxxFrame.isVideoFrame()) {
-      return new VideoFrame(cxxFrame);
+    for (const [i, data] of this.cacheMetadata.entries()) {
+      if (data.stream !== stream) {
+        continue;
+      }
+      if (!streamIndex || (streamIndex && streamIndex === data.streamIndex)) {
+        return i;
+      }
     }
-
-    return new Frame(cxxFrame);
+    return undefined;
   }
 
-  __internalAssembleFrame(cxxFrame) {
-    if (!cxxFrame) return undefined;
-    if (cxxFrame.isDepthFrame()) return new DepthFrame(cxxFrame);
-    if (cxxFrame.isVideoFrame()) return new VideoFrame(cxxFrame);
-    return new Frame(cxxFrame);
-  }
+  __internalGetFrameCache(stream, streamIndex, callback) {
+    let idx = this.__internalFindFrameInCache(stream, streamIndex);
+    if (idx === undefined) {
+      let frame = callback(stream, streamIndex);
+      if (!frame) return undefined;
 
-  __internalGetFrame(stream) {
-    let s = checkStringNumber(stream,
-        constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-        stream2Int,
-        'FrameSet.getFrame() expects the argument to be string or integer',
-        'FrameSet.getFrame()\'s argument value is invalid');
-    return this.__internalAssembleFrame(this.cxxFrameSet.getFrame(s));
-  }
-
-  __internalGetFrameCache(stream, callback) {
-    if (! this.cache[stream]) {
-      this.cache[stream] = callback(stream);
+      this.cache.push(frame);
+      // the stream parameter may be stream.STREAM_ANY, but when we store the frame in
+      // cache, we shall store its actual stream type.
+      this.cacheMetadata.push({stream: frame.streamType, streamIndex: streamIndex});
+      idx = this.cache.length - 1;
     } else {
-      let frame = this.cache[stream];
+      let frame = this.cache[idx];
       if (!frame.cxxFrame) {
         frame.cxxFrame = new RS2.RSFrame();
       }
-      if (! this.cxxFrameSet.replaceFrame(stream, frame.cxxFrame)) {
-        this.cache[stream] = undefined;
+
+      // as cache metadata entries always use actual stream type, we use the actual
+      // stream types to easy native from processing stream.STREAM_ANY
+      if (! this.cxxFrameSet.replaceFrame(
+          this.cacheMetadata[idx].stream, streamIndex, frame.cxxFrame)) {
+        this.cache[idx] = undefined;
+        this.cacheMetadata[idx] = undefined;
       }
     }
-    return this.cache[stream];
+    return this.cache[idx];
   }
 
   /**
    * Get the frame with specified stream
    *
    * @param {Integer|String} stream stream type of the frame
+   * @param {Integer} streamIndex index of the stream, 0 means the first
+   * matching stream
    * @return {DepthFrame|VideoFrame|Frame|undefined}
    */
-  getFrame(stream) {
-    return this.__internalGetFrameCache(stream, this.__internalGetFrame.bind(this));
+  getFrame(stream, streamIndex = 0) {
+    const funcName = 'FrameSet.getFrame()';
+    checkArgumentLength(1, 2, arguments.length, funcName);
+    const s = checkArgumentType(arguments, constants.stream, 0, funcName);
+    if (arguments.length === 2) {
+      checkArgumentType(arguments, 'integer', 1, funcName);
+    }
+    return this.__internalGetFrameCache(s, streamIndex, this.__internalGetFrame.bind(this));
   }
 
   __update() {
@@ -1741,6 +2541,8 @@ class FrameSet {
         f.release();
       }
     });
+    this.cache = [];
+    this.cacheMetadata = [];
   }
 
   release() {
@@ -1755,7 +2557,6 @@ class FrameSet {
    */
   destroy() {
     this.release();
-    this.cache = [];
     this.cxxFrameSet = undefined;
   }
 }
@@ -1777,20 +2578,15 @@ class Pipeline {
    * @param {Context} [context] - the {@link Context} that is being used by the pipeline
    */
   constructor(context) {
-    if (arguments.length > 1) {
-      throw new TypeError('new Pipeline() can only accept at most 1 argument');
-    }
-
+    const funcName = 'Pipeline.constructor()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
     let ownCtx = true;
     let ctx;
 
     if (arguments.length === 1) {
-      if (arguments[0] instanceof Context) {
-        ownCtx = false;
-        this.ctx = arguments[0];
-      } else {
-        throw new TypeError('new Pipeline() expects a Context argument');
-      }
+      checkArgumentType(arguments, Context, 0, funcName);
+      ownCtx = false;
+      this.ctx = arguments[0];
     }
 
     if (ownCtx === true) {
@@ -1801,6 +2597,7 @@ class Pipeline {
     this.cxxPipeline.create(this.ctx.cxxCtx);
     this.started = false;
     this.frameSet = new FrameSet();
+    internal.addObject(this);
   }
 
   /**
@@ -1811,9 +2608,12 @@ class Pipeline {
   destroy() {
     if (this.started === true) this.stop();
 
-    this.cxxPipeline.destroy();
-    this.cxxPipeline = undefined;
-    if (this.ownCtx) {
+    if (this.cxxPipeline) {
+      this.cxxPipeline.destroy();
+      this.cxxPipeline = undefined;
+    }
+
+    if (this.ownCtx && this.ctx) {
       this.ctx.destroy();
     }
     this.ctx = undefined;
@@ -1839,19 +2639,18 @@ class Pipeline {
    * @return {@link PipelineProfile}
    */
   start() {
+    const funcName = 'Pipeline.start()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
     if (this.started === true) return undefined;
 
     if (arguments.length === 0) {
       this.started = true;
       return new PipelineProfile(this.cxxPipeline.start());
     } else {
-      if (!(arguments[0] instanceof Config)) {
-        throw new TypeError('Invalid argument for Pipeline.start()');
-      }
+      checkArgumentType(arguments, Config, 0, funcName);
       this.started = true;
       return new PipelineProfile(this.cxxPipeline.startWithConfig(arguments[0].cxxConfig));
     }
-    return undefined;
   }
 
   /**
@@ -1883,17 +2682,16 @@ class Pipeline {
    * @return {FrameSet|undefined} a FrameSet object or Undefined
    * @see See [Pipeline.latestFrame]{@link Pipeline#latestFrame}
    */
-  waitForFrames() {
-    if ((arguments.length === 1 && isNumber(arguments[0])) || arguments.length === 0) {
-      const timeout = arguments[0] || 5000;
-      this.frameSet.release();
-      if (this.cxxPipeline.waitForFrames(this.frameSet.cxxFrameSet, timeout)) {
-        this.frameSet.__update();
-        return this.frameSet;
-      }
-      return undefined;
+  waitForFrames(timeout = 5000) {
+    const funcName = 'Pipeline.waitForFrames()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName);
+    this.frameSet.release();
+    if (this.cxxPipeline.waitForFrames(this.frameSet.cxxFrameSet, timeout)) {
+      this.frameSet.__update();
+      return this.frameSet;
     }
-    throw new TypeError('Pipeline.waitForFrames() expects an integer timeout argument');
+    return undefined;
   }
 
   get latestFrame() {
@@ -1946,6 +2744,15 @@ class Pipeline {
 class PipelineProfile {
   constructor(profile) {
     this.cxxPipelineProfile = profile;
+    internal.addObject(this);
+  }
+
+  /**
+   * Check if the object is valid
+   * @return {Boolean}
+   */
+  get isValid() {
+    return (this.cxxPipelineProfile != null);
   }
 
   /**
@@ -1959,13 +2766,34 @@ class PipelineProfile {
 
     const array = [];
     profiles.forEach((profile) => {
-      if (profile.isVideoProfile()) {
-        array.push(new VideoStreamProfile(profile));
-      } else {
-        array.push(new StreamProfile(profile));
-      }
+      array.push(StreamProfile._internalCreateStreamProfile(profile));
     });
     return array;
+  }
+
+  /**
+   * Return the selected stream profile, which are enabled in this profile.
+   * @param {Integer|String} streamType the stream type of the desired profile,
+   * see {@link stream} for avaiable values
+   * @param {Integer} streamIndex stream index of the desired profile, -1 for any matching
+   * @return {StreamProfile} the first matching stream profile
+   */
+  getStream(streamType, streamIndex = -1) {
+    const funcName = 'PipelineProfile.getStream()';
+    checkArgumentLength(1, 2, arguments.length, funcName);
+    const s = checkArgumentType(arguments, constants.stream, 0, funcName);
+    checkArgumentType(arguments, 'number', 1, funcName);
+    let profiles = this.getStreams();
+    if (!profiles) {
+      return undefined;
+    }
+    for (let i = 0; i < profiles.length; i++) {
+      if (profiles[i].streamType === s &&
+          (streamIndex === -1 || (streamIndex === profiles[i].indexValue))) {
+        return profiles[i];
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -1983,7 +2811,19 @@ class PipelineProfile {
    * @return {Device} the pipeline selected device
    */
   getDevice() {
-    return new Device(this.cxxPipelineProfile.getDevice());
+    return Device._internalCreateDevice(this.cxxPipelineProfile.getDevice());
+  }
+
+  /**
+   * Destroy the resource associated with this object
+   *
+   * @return {undefined}
+   */
+  destroy() {
+    if (this.cxxPipelineProfile) {
+      this.cxxPipelineProfile.destroy();
+      this.cxxPipelineProfile = undefined;
+    }
   }
 }
 
@@ -2000,6 +2840,7 @@ class PipelineProfile {
 class Config {
   constructor() {
     this.cxxConfig = new RS2.RSConfig();
+    internal.addObject(this);
   }
 
  /**
@@ -2027,18 +2868,14 @@ class Config {
   * @param {Integer} fps stream frames per second. 0 indicates any.
   */
   enableStream(stream, index, width, height, format, fps) {
-    let s = checkStringNumber(stream,
-        constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-        stream2Int,
-        'Config.enableStream() expects a number or string to specify the stream',
-        'Config.enableStream() expects a valid value to specify the stream');
-
-    let f = checkStringNumber(format,
-      constants.format.FORMAT_ANY, constants.format.FORMAT_COUNT,
-      format2Int,
-      'Config.enableStream() expects a property \'format\' to be string or integer',
-      'Config.enableStream() expects a valid value to specify the format');
-
+    const funcName = 'Config.enableStream()';
+    checkArgumentLength(6, 6, arguments.length, funcName);
+    const s = checkArgumentType(arguments, constants.stream, 0, funcName);
+    checkArgumentType(arguments, 'number', 1, funcName);
+    checkArgumentType(arguments, 'number', 2, funcName);
+    checkArgumentType(arguments, 'number', 3, funcName);
+    const f = checkArgumentType(arguments, constants.format, 4, funcName);
+    checkArgumentType(arguments, 'number', 5, funcName);
     this.cxxConfig.enableStream(s, index, width, height, f, fps);
   }
 
@@ -2046,12 +2883,9 @@ class Config {
    * Disable a device stream explicitly, to remove any requests on this stream profile.
    */
   disableStream(stream) {
-    let s = checkStringNumber(stream,
-    constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-    stream2Int,
-    'Config.enableStream() expects a number or string to specify the stream',
-    'Config.enableStream() expects a valid value to specify the stream');
-
+    const funcName = 'Config.disableStream()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const s = checkArgumentType(arguments, constants.stream, 0, funcName);
     this.cxxConfig.disableStream(s);
   }
 
@@ -2079,6 +2913,9 @@ class Config {
    * Device.getCameraInfo(camera_info.CAMERA_INFO_SERIAL_NUMBER).
    */
   enableDevice(serial) {
+    const funcName = 'Config.enableDevice()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
     this.cxxConfig.enableDevice(serial);
   }
 
@@ -2089,10 +2926,16 @@ class Config {
    * This request cannot be used if {@link Config.enableRecordToFile} is called for the current
    * config, and vise versa
    *
-   * @param {String} filename the playback file of the device
+   * @param {String} fileName the playback file of the device
+   * @param {Boolean} repeat whether to repeat the playback automatically
    */
-  enableDeviceFromFile(filename) {
-    this.cxxConfig.enableDeviceFromFile(filename);
+  enableDeviceFromFile(fileName, repeat = true) {
+    const funcName = 'Config.enableDeviceFromFile()';
+    checkArgumentLength(1, 2, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    checkArgumentType(arguments, 'boolean', 1, funcName);
+    checkFileExistence(fileName);
+    this.cxxConfig.enableDeviceFromFileRepeatOption(fileName, repeat);
   }
 
   /**
@@ -2100,10 +2943,13 @@ class Config {
    * This request cannot be used if {@link Config.enableDeviceFromFile} is called for the current
    * config, and vise versa as available.
    *
-   * @param {String} filename the desired file for the output record
+   * @param {String} fileName the desired file for the output record
    */
-  enableRecordToFile(filename) {
-    this.cxxConfig.enableRecordToFile(filename);
+  enableRecordToFile(fileName) {
+    const funcName = 'Config.enableRecordToFile()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'string', 0, funcName);
+    this.cxxConfig.enableRecordToFile(fileName);
   }
 
   /**
@@ -2128,15 +2974,10 @@ class Config {
    * filters and pipeline requests.
    */
   resolve(pipeline) {
-    if (arguments.length === 0) {
-        throw new TypeError('Invalid argument for Config.resolve()');
-    } else {
-      if (!(arguments[0] instanceof Pipeline)) {
-        throw new TypeError('Invalid argument for Config.resolve()');
-      }
-      return new PipelineProfile(this.cxxConfig.resolve(arguments[0].cxxPipeline));
-    }
-    return undefined;
+    const funcName = 'Config.resolve()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Pipeline, 0, funcName);
+    return new PipelineProfile(this.cxxConfig.resolve(arguments[0].cxxPipeline));
   }
 
   /**
@@ -2148,13 +2989,19 @@ class Config {
    * under the config filters and the available devices.
    */
   canResolve(pipeline) {
-    if (arguments.length === 0) {
-        throw new TypeError('Invalid argument for Config.canResolve()');
-    } else {
-      if (!(arguments[0] instanceof Pipeline)) {
-        throw new TypeError('Invalid argument for Config.canResolve()');
-      }
-      return this.cxxConfig.canResolve(arguments[0].cxxPipeline);
+    const funcName = 'Config.canResolve()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Pipeline, 0, funcName);
+    return this.cxxConfig.canResolve(arguments[0].cxxPipeline);
+  }
+
+  /**
+   * Release resources associated with the object
+   */
+  destroy() {
+    if (this.cxxConfig) {
+      this.cxxConfig.destroy();
+      this.cxxConfig = null;
     }
   }
 }
@@ -2173,17 +3020,16 @@ class Syncer {
    * @param {Number} timeout Max time in milliseconds to wait until an exception will be thrown
    * @return {Frame[]|undefined} Set of coherent frames or undefined if no frames.
    */
-  waitForFrames(timeout) {
-    if ((arguments.length === 1 && isNumber(arguments[0])) || arguments.length === 0) {
-      const timeout = arguments[0] || 5000;
-      this.frameSet.release();
-      if (this.cxxSyncer.waitForFrames(this.frameSet.cxxFrameSet, timeout)) {
-        this.frameSet.__update();
-        return this.frameSet;
-      }
-      return undefined;
+  waitForFrames(timeout = 5000) {
+    const funcName = 'Syncer.waitForFrames()';
+    checkArgumentLength(0, 1, arguments.length, funcName);
+    checkArgumentType(arguments, 'number', 0, funcName);
+    this.frameSet.release();
+    if (this.cxxSyncer.waitForFrames(this.frameSet.cxxFrameSet, timeout)) {
+      this.frameSet.__update();
+      return this.frameSet;
     }
-    throw new TypeError('Syncer.waitForFrames() expects an integer timeout argument');
+    return undefined;
   }
 
   /**
@@ -2203,12 +3049,15 @@ class Syncer {
    * Release resources associated with the object
    */
   destroy() {
-    this.cxxSyncer.destroy();
-    this.cxxSyncer = undefined;
+    if (this.cxxSyncer) {
+      this.cxxSyncer.destroy();
+      this.cxxSyncer = undefined;
+    }
+
     if (this.frameset) {
       this.frameSet.destroy();
+      this.frameSet = undefined;
     }
-    this.frameSet = undefined;
   }
 }
 
@@ -2222,8 +3071,12 @@ class DeviceHub {
    * @param {Context} context - a librealsense2 Context
    */
   constructor(context) {
+    const funcName = 'DeviceHub.constructor()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Context, 0, funcName);
     this.context = context;
     this.cxxHub = new RS2.RSDeviceHub(context.cxxCtx);
+    internal.addObject(this);
   }
 
   /**
@@ -2233,7 +3086,7 @@ class DeviceHub {
    */
   waitForDevice() {
     let dev = this.cxxHub.waitForDevice();
-    return (dev ? new Device(dev) : undefined);
+    return (dev ? Device._internalCreateDevice(dev) : undefined);
   }
 
   /**
@@ -2241,6 +3094,9 @@ class DeviceHub {
    * @return {Boolean}
    */
   isConnected(device) {
+    const funcName = 'DeviceHub.isConnected()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, Device, 0, funcName);
     return this.cxxHub.isConnected(device.cxxDev);
   }
 
@@ -2248,8 +3104,137 @@ class DeviceHub {
    * Release resources associated with the object
    */
   destroy() {
-    this.cxxHub.destroy();
-    this.cxxHub = undefined;
+    if (this.cxxHub) {
+      this.cxxHub.destroy();
+      this.cxxHub = undefined;
+    }
+  }
+}
+
+/**
+ * Base class of specific filter classes, see {@link DecimationFilter}.
+ * Don't create Filter objects directly from this class, use child classes,
+ */
+class Filter extends Options {
+  constructor(type) {
+    super(new RS2.RSFilter(type));
+    internal.addObject(this);
+  }
+
+  _internalGetInputType() {
+    return DepthFrame;
+  }
+
+  _internalPrepareOutputFrame() {
+    if (!this.frame) {
+      this.frame = new DepthFrame();
+    }
+  }
+  /**
+   * Apply the filter processing on the frame and return the processed frame
+   * @param {Frame} frame the depth frame to be processed
+   * @return {Frame}
+   */
+  process(frame) {
+    const funcName = 'Filter.process()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    checkArgumentType(arguments, this._internalGetInputType(), 0, funcName);
+    this._internalPrepareOutputFrame();
+    if (this.cxxObj && this.cxxObj.process(frame.cxxFrame, this.frame.cxxFrame)) {
+      this.frame.updateProfile();
+      return this.frame;
+    }
+    return undefined;
+  }
+
+  /**
+   * Release resources associated with the object
+   */
+  destroy() {
+    if (this.cxxObj) {
+      this.cxxObj.destroy();
+      this.cxxObj = null;
+    }
+    if (this.frame) {
+      this.frame.destroy();
+      this.frame = undefined;
+    }
+  }
+}
+
+/**
+ * Depth post-processing filter block. This block can apply decimation filter on depth frame.
+ */
+class DecimationFilter extends Filter {
+  constructor() {
+    super('decimation');
+  }
+  // override base implementation
+  _internalGetInputType() {
+    return VideoFrame;
+  }
+  _internalPrepareOutputFrame() {
+    if (!this.frame) {
+      this.frame = new VideoFrame();
+    }
+  }
+}
+
+/**
+ * Depth post-processing filter block. This block can apply temporal filter on depth frame.
+ */
+class TemporalFilter extends Filter {
+  constructor() {
+    super('temporal');
+  }
+}
+
+/**
+ * Depth post-processing filter block. This block can apply spatial filter on depth frame.
+ */
+class SpatialFilter extends Filter {
+  constructor() {
+    super('spatial');
+  }
+}
+
+/**
+ * Depth post-processing filter block. This block replaces empty pixels with data from adjacent
+ * pixels based on the method selected.
+ */
+class HoleFillingFilter extends Filter {
+  constructor() {
+    super('hole-filling');
+  }
+}
+
+/**
+ * Post processing block that could transform disparity frame to depth frame
+ */
+class DisparityToDepthTransform extends Filter {
+  constructor() {
+    super('disparity-to-depth');
+  }
+
+  // override base implementation
+  _internalGetInputType() {
+    return DisparityFrame;
+  }
+}
+
+/**
+ * Post processing block that could transform depth frame to disparity frame
+ */
+class DepthToDisparityTransform extends Filter {
+  constructor() {
+    super('depth-to-disparity');
+  }
+
+  // override base implementation
+  _internalPrepareOutputFrame() {
+    if (!this.frame) {
+      this.frame = new DisparityFrame();
+    }
   }
 }
 
@@ -2360,58 +3345,195 @@ function checkStringNumber(v, rangeStart, rangeEnd, convertFunc, typeErrMsg, ran
   return r;
 }
 
-function range(start, end, step) {
-  let a = [];
-  step = parseInt(step) || 1;
-  if (arguments.length === 1) {
-    start = 0;
-    end = parseInt(arguments[0]); // Count
-  } else {
-    start = parseInt(start);
-    end = parseInt(end);
+function checkArgumentLength(minLengh, maxLength, actualLength, funcName) {
+  if (actualLength >= minLengh && actualLength <= maxLength) {
+    return;
   }
 
-  for (let i = start; i< end; i += step) {
-    a.push(i);
+  if (minLengh === maxLength) {
+    throw new TypeError(funcName + ' expects ' + minLengh + ' arguments');
+  } else {
+    throw new TypeError(funcName + ' expects ' + minLengh + '~' + maxLength + ' arguments');
   }
-  return a;
 }
 
-function checkStreamProfileObject(profile) {
-  if (typeof profile !== 'object') {
-    throw new TypeError('The stream profile object is not an valid object');
+function checkArgumentType(args, expectedType, argIndex, funcName, start, end) {
+  if (argIndex >= args.length) {
+    return undefined;
   }
-  let stream = checkStringNumber(profile.stream,
-    constants.stream.STREAM_ANY, constants.stream.STREAM_COUNT,
-    stream2Int,
-    'StreamProfileObject expects a property \'stream\' to be string or integer',
-    'StreamProfileObject\'s \'stream\' property value is invalid');
-  if (!isNumber(profile.width)) {
-    throw new TypeError('StreamProfileObject expects a property \'width\' to be an integer');
+  let arg = args[argIndex];
+  let errMsgPrefix = 'argument ' + argIndex + ' of ' + funcName;
+  let wrongTypeErrMsgPrefix = errMsgPrefix + ' should be a/an ';
+  let unsupportedErrMsg = errMsgPrefix + ' is an unsupported type';
+  let rangeErrMsg = errMsgPrefix + ' has an invalid value';
+
+  switch (expectedType) {
+    case 'number':
+    case 'string':
+    case 'object':
+    case 'boolean':
+    case 'function':
+      if (typeof arg !== expectedType) {
+        throw new TypeError(wrongTypeErrMsgPrefix + expectedType);
+      }
+      if (expectedType === 'number' && (start !== undefined) && (end !== undefined)) {
+        if (arg < start || arg > end) {
+          throw new TypeError(rangeErrMsg);
+        }
+      }
+      break;
+    case 'ArrayBuffer':
+      if (!(isArrayBuffer(arg))) {
+        throw new TypeError(wrongTypeErrMsgPrefix + expectedType);
+      }
+      break;
+    case 'integer':
+      if (!Number.isInteger(arg)) {
+        throw new TypeError(wrongTypeErrMsgPrefix + expectedType);
+      }
+      break;
+    default:
+      if (typeof expectedType === 'function') {
+        if (!(arg instanceof expectedType)) {
+          throw new TypeError(wrongTypeErrMsgPrefix + expectedType.name);
+        }
+      } else if (typeof expectedType === 'object') {
+        for (let mem in constants) {
+          if (constants[mem] === expectedType) {
+            return checkEnumObjectArgument(args, expectedType, argIndex, funcName, start, end);
+          }
+        }
+        throw new TypeError(unsupportedErrMsg);
+      } else {
+        throw new TypeError(unsupportedErrMsg);
+      }
+      break;
   }
-  if (!isNumber(profile.height)) {
-    throw new TypeError('StreamProfileObject expects a property \'height\' to be an integer');
+}
+
+function checkEnumObjectArgument(args, expectedType, argIndex, funcName, start, end) {
+  let rangeStart;
+  let rangeEnd;
+  let convertFunc;
+  let errMsgPrefix = 'argument ' + argIndex + ' of ' + funcName;
+  let wrongTypeErrMsgPrefix = errMsgPrefix + ' should be a/an ';
+  let unsupportedErrMsg = errMsgPrefix + ' is an unsupported type';
+  let rangeErrMsg = errMsgPrefix + ' has an invalid value';
+  let typeErrMsg;
+
+  switch (expectedType) {
+    case constants.stream:
+      rangeStart = constants.stream.STREAM_ANY;
+      rangeEnd = constants.stream.STREAM_COUNT;
+      convertFunc = stream2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'stream';
+      break;
+    case constants.format:
+      rangeStart = constants.format.FORMAT_ANY;
+      rangeEnd = constants.format.FORMAT_COUNT;
+      convertFunc = format2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'format';
+      break;
+    case constants.option:
+      rangeStart = constants.option.OPTION_BACKLIGHT_COMPENSATION;
+      rangeEnd = constants.option.OPTION_COUNT;
+      convertFunc = option2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'option';
+      break;
+    case constants.camera_info:
+      rangeStart = constants.camera_info.CAMERA_INFO_NAME;
+      rangeEnd = constants.camera_info.CAMERA_INFO_COUNT;
+      convertFunc = cameraInfo2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'camera_info';
+      break;
+    case constants.recording_mode:
+      rangeStart = constants.recording_mode.RECORDING_MODE_BLANK_FRAMES;
+      rangeEnd = constants.recording_mode.RECORDING_MODE_COUNT;
+      convertFunc = recordingMode2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'recording_mode';
+      break;
+    case constants.frame_metadata:
+      rangeStart = constants.frame_metadata.FRAME_METADATA_FRAME_COUNTER;
+      rangeEnd = constants.frame_metadata.FRAME_METADATA_COUNT;
+      convertFunc = frameMetadata2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'frame_metadata';
+      break;
+    case constants.distortion:
+      rangeStart = constants.distortion.DISTORTION_NONE;
+      rangeEnd = constants.distortion.DISTORTION_COUNT;
+      convertFunc = distortion2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'distortion';
+      break;
+    case constants.notification_category:
+      rangeStart = constants.notification_category.NOTIFICATION_CATEGORY_FRAMES_TIMEOUT;
+      rangeEnd = constants.notification_category.NOTIFICATION_CATEGORY_COUNT;
+      convertFunc = notificationCategory2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'notification_category';
+      break;
+    case constants.timestamp_domain:
+      rangeStart = constants.timestamp_domain.TIMESTAMP_DOMAIN_HARDWARE_CLOCK;
+      rangeEnd = constants.timestamp_domain.TIMESTAMP_DOMAIN_COUNT;
+      convertFunc = timestampDomain2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'timestamp_domain';
+      break;
+    case constants.playback_status:
+      rangeStart = constants.playback_status.PLAYBACK_STATUS_UNKNOWN;
+      rangeEnd = constants.playback_status.PLAYBACK_STATUS_COUNT;
+      convertFunc = playbackStatus2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'playback_status';
+      break;
+    case constants.sr300_visual_preset:
+      rangeStart = constants.sr300_visual_preset.SR300_VISUAL_PRESET_SHORT_RANGE;
+      rangeEnd = constants.sr300_visual_preset.SR300_VISUAL_PRESET_COUNT;
+      convertFunc = sr300VisualPreset2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'sr300_visual_preset';
+      break;
+    case constants.rs400_visual_preset:
+      rangeStart = constants.rs400_visual_preset.RS2_RS400_VISUAL_PRESET_CUSTOM;
+      rangeEnd = constants.rs400_visual_preset.RS400_VISUAL_PRESET_COUNT;
+      convertFunc = rs400VisualPreset2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'rs400_visual_preset';
+      break;
+    case constants.log_severity:
+      rangeStart = constants.log_severity.LOG_SEVERITY_DEBUG;
+      rangeEnd = constants.log_severity.LOG_SEVERITY_COUNT;
+      convertFunc = logSeverity2Int;
+      typeErrMsg = wrongTypeErrMsgPrefix + 'log_severity';
+      break;
+    default:
+      throw new TypeError(unsupportedErrMsg);
   }
-  if (!isNumber(profile.fps)) {
-    throw new TypeError('StreamProfileObject expects a property \'fps\' to be an integer');
+  return checkStringNumber(
+      args[argIndex], rangeStart, rangeEnd, convertFunc, typeErrMsg, rangeErrMsg);
+}
+
+function checkNumberRange(arg, start, end, argIndex, funcName) {
+  if (arg < start || arg > end) {
+    throw new TypeError('argument ' + argIndex + ' of ' + funcName + ' is invalid');
   }
-  let format = checkStringNumber(profile.format,
-      constants.format.FORMAT_ANY, constants.format.FORMAT_COUNT,
-      format2Int,
-      'StreamProfileObject expects a property \'format\' to be string or integer',
-      'StreamProfileObject\'s \'format\' property value is invalid');
-  return {
-    stream: stream,
-    width: profile.width,
-    height: profile.height,
-    fps: profile.fps,
-    format: format,
-  };
+}
+
+function checkDiscreteArgumentValue(args, argIndex, valueArray, funcName) {
+  if (valueArray.indexOf(args[argIndex]) === -1) {
+    throw new TypeError('argument ' + argIndex + ' of ' + funcName + ' is invalid');
+  }
+}
+
+function checkDiscreteArgumentLength(lenthArray, actualLength, funcName) {
+  if (lenthArray.indexOf(actualLength) === -1) {
+    throw new TypeError(funcName + ' expects ' + lenthArray.toString() + ' arguments');
+  }
 }
 
 function equalsToEither(arg, strConst, numConst) {
   return (typeof arg === 'string' && arg === strConst) ||
          (typeof arg === 'number' && arg === numConst);
+}
+
+function checkFileExistence(file) {
+  if (!fs.existsSync(file)) {
+    throw new TypeError('Can\'t open file: ' + file);
+  }
 }
 
 /**
@@ -2422,6 +3544,10 @@ function equalsToEither(arg, strConst, numConst) {
  * @return {Object} like {x: 0, y:0}.
  */
 util.projectPointToPixel = function(intrinsics, pointCoordinate) {
+  const funcName = 'util.projectPointToPixel';
+  checkArgumentLength(2, 2, arguments.length, funcName);
+  checkArgumentType(arguments, 'object', 0, funcName);
+  checkArgumentType(arguments, 'object', 1, funcName);
   if (equalsToEither(intrinsics.model,
       distortion.distortion_inverse_brown_conrady,
       distortion.DISTORTION_INVERSE_BROWN_CONRADY)) {
@@ -2466,6 +3592,11 @@ util.projectPointToPixel = function(intrinsics, pointCoordinate) {
  * @return {Object} like {x: 0, y:0, z:0}.
  */
 util.deprojectPixelToPoint = function(intrinsics, pixelCoordinate, depth) {
+  const funcName = 'util.deprojectPixelToPoint';
+  checkArgumentLength(3, 3, arguments.length, funcName);
+  checkArgumentType(arguments, 'object', 0, funcName);
+  checkArgumentType(arguments, 'object', 1, funcName);
+  checkArgumentType(arguments, 'number', 2, funcName);
   if (equalsToEither(intrinsics.model,
       distortion.distortion_modified_brown_conrady,
       distortion.DISTORTION_MODIFIED_BROWN_CONRADY)) {
@@ -2505,6 +3636,10 @@ util.deprojectPixelToPoint = function(intrinsics, pixelCoordinate, depth) {
  * @return {Object} The tranformed 3D coordinate, like {x:0, y:0, z:0}.
  */
 util.transformPointToPoint = function(extrinsics, pointCoordinate) {
+  const funcName = 'util.transformPointToPoint';
+  checkArgumentLength(2, 2, arguments.length, funcName);
+  checkArgumentType(arguments, 'object', 0, funcName);
+  checkArgumentType(arguments, 'object', 1, funcName);
   const x = extrinsics.rotation[0] * pointCoordinate.x +
             extrinsics.rotation[3] * pointCoordinate.y +
             extrinsics.rotation[6] * pointCoordinate.z +
@@ -2523,13 +3658,18 @@ util.transformPointToPoint = function(extrinsics, pointCoordinate) {
 /**
  * Save the frame to a file asynchronously
  *
- * @param {path} target file path
- * @param {frame} frame to be saved
- * @param {fileFormat} the target file format, currently only 'png' is supported
+ * @param {string} path target file path
+ * @param {Frame} frame frame to be saved
+ * @param {string} fileFormat the target file format, currently only 'png' is supported
  * @return {Promise}
  */
-util.writeFrameToFileAsync = function(path, frame, fileFormat) {
-  if (typeof fileFormat === 'string' && fileFormat.toLowerCase() === 'png') {
+util.writeFrameToFileAsync = function(path, frame, fileFormat = 'png') {
+  const funcName = 'util.writeFrameToFileAsync';
+  checkArgumentLength(3, 3, arguments.length, funcName);
+  checkArgumentType(arguments, 'string', 0, funcName);
+  checkArgumentType(arguments, Frame, 1, funcName);
+  checkArgumentType(arguments, 'string', 2, funcName);
+  if (fileFormat.toLowerCase() === 'png') {
     let png = new PNG({
       width: frame.width,
       height: frame.height,
@@ -2547,15 +3687,48 @@ util.writeFrameToFileAsync = function(path, frame, fileFormat) {
 };
 
 /**
+ * Field of view (FOV) info:
+ * @typedef {Object} FOVObject
+ * @property {Float32} h - horizontal field of view
+ * @property {Float32} v - vertical field of view
+ * @see [util.fov]{@link util#fov}
+ */
+
+/**
+ * Get the field of view from an IntrinsicsObject
+ * @param {IntrinsicsObject} intrinsics the intrinsics to calculate field of view.
+ * @return {FOVObject}
+ */
+util.fov = function(intrinsics) {
+  const funcName = 'util.fov';
+  checkArgumentLength(1, 1, arguments.length, funcName);
+  checkArgumentType(arguments, 'object', 0, funcName);
+  let ppx = intrinsics.ppx;
+  let ppy = intrinsics.ppy;
+  let width = intrinsics.width;
+  let height = intrinsics.height;
+  let fx = intrinsics.fx;
+  let fy = intrinsics.fy;
+  let h = (Math.atan(ppx + 0.5, fx) + Math.atan(width - ppx - 0.5, fx)) * 57.2957795;
+  let v = (Math.atan(ppy + 0.5, fy) + Math.atan(height - ppy - 0.5, fy)) * 57.2957795;
+  return {h: h, v: v};
+};
+
+/**
  * Save the frame to a file synchronously
  *
- * @param {path} target file path
- * @param {frame} frame to be saved
- * @param {fileFormat} the target file format, currently only 'png' is supported
+ * @param {string} path target file path
+ * @param {Frame} frame frame to be saved
+ * @param {string} fileFormat the target file format, currently only 'png' is supported
  * @return {undefined}
  */
-util.writeFrameToFile = function(path, frame, fileFormat) {
-  if (typeof fileFormat === 'string' && fileFormat.toLowerCase() === 'png') {
+util.writeFrameToFile = function(path, frame, fileFormat = 'png') {
+  const funcName = 'util.writeFrameToFile';
+  checkArgumentLength(3, 3, arguments.length, funcName);
+  checkArgumentType(arguments, 'string', 0, funcName);
+  checkArgumentType(arguments, Frame, 1, funcName);
+  checkArgumentType(arguments, 'string', 2, funcName);
+  if (fileFormat.toLowerCase() === 'png') {
     const opt = {
       width: frame.width,
       height: frame.height,
@@ -2573,10 +3746,13 @@ util.writeFrameToFile = function(path, frame, fileFormat) {
 /**
  * Get all the frame metadata representation as a string
  *
- * @param {frame} frame to be saved
+ * @param {frame} frame frame to be saved
  * @return {String} the string representation of all supported frame metadata.
  */
 function frameMetadataContent(frame) {
+  const funcName = 'frameMetadataContent';
+  checkArgumentLength(1, 1, arguments.length, funcName);
+  checkArgumentType(arguments, Frame, 0, funcName);
   let content = 'Stream,' + stream.streamToString(frame.profile.streamType)+'\nMetadata Attribute,Value\n'; // eslint-disable-line
   for (let i = 0; i < frame_metadata.FRAME_METADATA_COUNT; i++) {
     if (frame.supportsFrameMetadata(i)) {
@@ -2589,11 +3765,15 @@ function frameMetadataContent(frame) {
 /**
  * Save the frame metadata string representation to a file asynchronously
  *
- * @param {path} target file path
- * @param {frame} frame to extract metadata from
+ * @param {string} path target file path
+ * @param {Frame} frame frame to extract metadata from
  * @return {undefined}
  */
 util.writeFrameMetadataToFileAsync = function(path, frame) {
+  const funcName = 'util.writeFrameMetadataToFileAsync';
+  checkArgumentLength(2, 2, arguments.length, funcName);
+  checkArgumentType(arguments, 'string', 0, funcName);
+  checkArgumentType(arguments, Frame, 1, funcName);
   return new Promise((resolve, reject) => {
     const content = frameMetadataContent(frame);
     fs.writeFile(path, content, (err) => {
@@ -2614,6 +3794,10 @@ util.writeFrameMetadataToFileAsync = function(path, frame) {
  * @return {undefined}
  */
 util.writeFrameMetadataToFile = function(path, frame) {
+  const funcName = 'util.writeFrameMetadataToFile';
+  checkArgumentLength(2, 2, arguments.length, funcName);
+  checkArgumentType(arguments, 'string', 0, funcName);
+  checkArgumentType(arguments, Frame, 1, funcName);
   const content = frameMetadataContent(frame);
   const fd = fs.openSync(path, 'w');
   fs.writeSync(fd, content);
@@ -2648,8 +3832,9 @@ const format = {
    */
   format_xyz32f: 'xyz32f',
   /**
-   * String literal of <code>'yuyv'</code>. <br>Standard YUV pixel format as described in
-   * https://en.wikipedia.org/wiki/YUV. <br>Equivalent to its uppercase counterpart.
+   * String literal of <code>'yuyv'</code>. <br>32-bit y0, u, y1, v data for every two pixels.
+   * Similar to YUV422 but packed in a different order - https://en.wikipedia.org/wiki/YUV
+   * <br>Equivalent to its uppercase counterpart.
    */
   format_yuyv: 'yuyv',
   /**
@@ -2717,7 +3902,45 @@ const format = {
    * hooked to one of the GPIO's. <br>Equivalent to its uppercase counterpart.
    */
   format_gpio_raw: 'gpio-raw',
-
+  /**
+   * String literal of <code>'6dof'</code>. <br>Pose data packed as floats array, containing
+   * translation vector, rotation quaternion and prediction velocities and accelerations vectors
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  format_6dof: '6dof',
+  /**
+   * String literal of <code>'disparity32'</code>. <br>32-bit float-point disparity values.
+   * Depth->Disparity conversion : Disparity = Baseline*FocalLength/Depth.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  format_disparity32: 'disparity32',
+   /**
+   * String literal of <code>'mjpeg'</code>.
+   * <br>Bitstream encoding for video in which an image of each frame is encoded as JPEG-DIB.
+   */
+  format_mjpeg: 'mjpeg',
+   /**
+   * String literal of <code>'y8i'</code>. <br>8-bit per pixel interleaved. 8-bit left, 8-bit right.
+   */
+  format_y8i: 'y8i',
+   /**
+   * String literal of <code>'y12i'</code>.
+   * <br>12-bit per pixel interleaved. 12-bit left, 12-bit right. Each pixel is stored in a 24-bit word in little-endian order.
+   */
+  format_y12i: 'y12i',
+   /**
+   * String literal of <code>'inzi'</code>. <br>multi-planar Depth 16bit + IR 10bit.
+   */
+  format_inzi: 'inzi',
+   /**
+   * String literal of <code>'invi'</code>. <br>8-bit IR stream
+   */
+  format_invi: 'invi',
+   /**
+   * String literal of <code>'w10'</code>.
+   * <br>Grey-scale image as a bit-packed array. 4 pixel data stream taking 5 bytes
+   */
+  format_w10: 'w10',
   /**
    * When passed to enable stream, librealsense will try to provide best suited
    * format. <br>Equivalent to its lowercase counterpart.
@@ -2742,7 +3965,8 @@ const format = {
    */
   FORMAT_XYZ32F: RS2.RS2_FORMAT_XYZ32F,
   /**
-   * Standard YUV pixel format as described in https://en.wikipedia.org/wiki/YUV.
+   * 32-bit y0, u, y1, v data for every two pixels. Similar to YUV422 but packed in a different
+   * order - https://en.wikipedia.org/wiki/YUV.
    * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
@@ -2820,6 +4044,49 @@ const format = {
    */
   FORMAT_GPIO_RAW: RS2.RS2_FORMAT_GPIO_RAW,
   /**
+   * Pose data packed as floats array, containing translation vector, rotation quaternion
+   * and prediction velocities and accelerations vectors
+   * <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  FORMAT_6DOF: RS2.RS2_FORMAT_6DOF,
+  /**
+   * 32-bit float-point disparity values. Depth->Disparity conversion :
+   * Disparity = Baseline*FocalLength/Depth. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  FORMAT_DISPARITY32: RS2.RS2_FORMAT_DISPARITY32,
+   /**
+   * Bitstream encoding for video in which an image of each frame is encoded as JPEG-DIB.
+   * @type {Integer}
+   */
+  FORMAT_MJPEG: RS2.RS2_FORMAT_MJPEG,
+   /**
+   * 8-bit per pixel interleaved. 8-bit left, 8-bit right.
+   * @type {Integer}
+   */
+  FORMAT_Y8I: RS2.RS2_FORMAT_Y8I,
+   /**
+   * 12-bit per pixel interleaved. 12-bit left, 12-bit right. Each pixel is stored in a 24-bit word in little-endian order.
+   * @type {Integer}
+   */
+  FORMAT_Y12I: RS2.RS2_FORMAT_Y12I,
+   /**
+   * multi-planar Depth 16bit + IR 10bit.
+   * @type {Integer}
+   */
+  FORMAT_INZI: RS2.RS2_FORMAT_INZI,
+   /**
+   * 8-bit IR stream.
+   * @type {Integer}
+   */
+  FORMAT_INVI: RS2.RS2_FORMAT_INVI,
+   /**
+   * Grey-scale image as a bit-packed array. 4 pixel data stream taking 5 bytes.
+   * @type {Integer}
+   */
+  FORMAT_W10: RS2.RS2_FORMAT_W10,
+  /**
    * Number of enumeration values. Not a valid input: intended to be used in for-loops.
    * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
@@ -2832,52 +4099,62 @@ const format = {
    * @return {String}
    */
   formatToString: function(format) {
-    if (arguments.length !== 1) {
-      throw new TypeError('format.formatToString(format) expects 1 argument');
-    } else {
-      let i = checkStringNumber(arguments[0],
-          this.FORMAT_ANY, this.FORMAT_COUNT,
-          format2Int,
-          'format.formatToString(format) expects a number or string as the 1st argument',
-          'format.formatToString(format) expects a valid value as the 1st argument');
-      switch (i) {
-        case this.FORMAT_ANY:
-          return this.format_any;
-        case this.FORMAT_Z16:
-          return this.format_z16;
-        case this.FORMAT_DISPARITY16:
-          return this.format_disparity16;
-        case this.FORMAT_XYZ32F:
-          return this.format_xyz32f;
-        case this.FORMAT_YUYV:
-          return this.format_yuyv;
-        case this.FORMAT_RGB8:
-          return this.format_rgb8;
-        case this.FORMAT_BGR8:
-          return this.format_bgr8;
-        case this.FORMAT_RGBA8:
-          return this.format_rgba8;
-        case this.FORMAT_BGRA8:
-          return this.format_bgra8;
-        case this.FORMAT_Y8:
-          return this.format_y8;
-        case this.FORMAT_Y16:
-          return this.format_y16;
-        case this.FORMAT_RAW10:
-          return this.format_raw10;
-        case this.FORMAT_RAW16:
-          return this.format_raw16;
-        case this.FORMAT_RAW8:
-          return this.format_raw8;
-        case this.FORMAT_UYVY:
-          return this.format_uyvy;
-        case this.FORMAT_MOTION_RAW:
-          return this.format_motion_raw;
-        case this.FORMAT_MOTION_XYZ32F:
-          return this.format_motion_xyz32f;
-        case this.FORMAT_GPIO_RAW:
-          return this.format_gpio_raw;
-      }
+    const funcName = 'format.formatToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.format, 0, funcName);
+    switch (i) {
+      case this.FORMAT_ANY:
+        return this.format_any;
+      case this.FORMAT_Z16:
+        return this.format_z16;
+      case this.FORMAT_DISPARITY16:
+        return this.format_disparity16;
+      case this.FORMAT_XYZ32F:
+        return this.format_xyz32f;
+      case this.FORMAT_YUYV:
+        return this.format_yuyv;
+      case this.FORMAT_RGB8:
+        return this.format_rgb8;
+      case this.FORMAT_BGR8:
+        return this.format_bgr8;
+      case this.FORMAT_RGBA8:
+        return this.format_rgba8;
+      case this.FORMAT_BGRA8:
+        return this.format_bgra8;
+      case this.FORMAT_Y8:
+        return this.format_y8;
+      case this.FORMAT_Y16:
+        return this.format_y16;
+      case this.FORMAT_RAW10:
+        return this.format_raw10;
+      case this.FORMAT_RAW16:
+        return this.format_raw16;
+      case this.FORMAT_RAW8:
+        return this.format_raw8;
+      case this.FORMAT_UYVY:
+        return this.format_uyvy;
+      case this.FORMAT_MOTION_RAW:
+        return this.format_motion_raw;
+      case this.FORMAT_MOTION_XYZ32F:
+        return this.format_motion_xyz32f;
+      case this.FORMAT_GPIO_RAW:
+        return this.format_gpio_raw;
+      case this.FORMAT_6DOF:
+        return this.format_6dof;
+      case this.FORMAT_DISPARITY32:
+		return this.format_disparity32;
+	  case this.RS2_FORMAT_MJPEG:
+		return this.format_mjpeg;
+	  case this.RS2_FORMAT_Y8I:
+		return this.format_y8i;
+	  case this.RS2_FORMAT_Y12I:
+		return this.format_y12i;
+	  case this.RS2_FORMAT_INZI:
+		return this.format_inzi;
+	  case this.RS2_FORMAT_INVI:
+		return this.format_invi;
+	  case this.RS2_FORMAT_W10:
+		return this.format_w10;
     }
   },
 };
@@ -2929,6 +4206,16 @@ const stream = {
      * through GPIO . <br>Equivalent to its uppercase counterpart.
      */
     stream_gpio: 'gpio',
+    /**
+     * String literal of <code>'pose'</code>. <br>6 Degrees of Freedom pose data, calculated by
+     * RealSense device. <br>Equivalent to its uppercase counterpart.
+     */
+    stream_pose: 'pose',
+    /**
+     * String literal of <code>'confidence'</code>. <br>Confidence stream
+     * <br>Equivalent to its uppercase counterpart.
+     */
+    stream_confidence: 'confidence',
 
     /**
      * Any stream. <br>Equivalent to its lowercase counterpart.
@@ -2977,7 +4264,17 @@ const stream = {
      * @type {Integer}
      */
     STREAM_GPIO: RS2.RS2_STREAM_GPIO,
-
+    /**
+     * 6 Degrees of Freedom pose data, calculated by RealSense device. <br>Equivalent to its
+     * lowercase counterpart.
+     * @type {Integer}
+     */
+    STREAM_POSE: RS2.RS2_STREAM_POSE,
+    /**
+     * Confidence stream. <br>Equivalent to its lowercase counterpart.
+     * @type {Integer}
+     */
+    STREAM_CONFIDENCE: RS2.RS2_STREAM_CONFIDENCE,
     /**
      * Number of enumeration values. Not a valid input: intended to be used in for-loops.
      * @type {Integer}
@@ -2990,32 +4287,30 @@ const stream = {
      * @return {String}
      */
     streamToString: function(stream) {
-      if (arguments.length !== 1) {
-        throw new TypeError('stream.streamToString(stream) expects 1 argument');
-      } else {
-        let i = checkStringNumber(arguments[0],
-            this.STREAM_ANY, this.STREAM_COUNT,
-            stream2Int,
-            'stream.streamToString(stream) expects a number or string as the 1st argument',
-            'stream.streamToString(stream) expects a valid value as the 1st argument');
-        switch (i) {
-          case this.STREAM_ANY:
-            return this.stream_any;
-          case this.STREAM_DEPTH:
-            return this.stream_depth;
-          case this.STREAM_COLOR:
-            return this.stream_color;
-          case this.STREAM_INFRARED:
-            return this.stream_infrared;
-          case this.STREAM_FISHEYE:
-            return this.stream_fisheye;
-          case this.STREAM_GYRO:
-            return this.stream_gyro;
-          case this.STREAM_ACCEL:
-            return this.stream_accel;
-          case this.STREAM_GPIO:
-            return this.stream_gpio;
-        }
+      const funcName = 'stream.streamToString()';
+      checkArgumentLength(1, 1, arguments.length, funcName);
+      const i = checkArgumentType(arguments, constants.stream, 0, funcName);
+      switch (i) {
+        case this.STREAM_ANY:
+          return this.stream_any;
+        case this.STREAM_DEPTH:
+          return this.stream_depth;
+        case this.STREAM_COLOR:
+          return this.stream_color;
+        case this.STREAM_INFRARED:
+          return this.stream_infrared;
+        case this.STREAM_FISHEYE:
+          return this.stream_fisheye;
+        case this.STREAM_GYRO:
+          return this.stream_gyro;
+        case this.STREAM_ACCEL:
+          return this.stream_accel;
+        case this.STREAM_GPIO:
+          return this.stream_gpio;
+        case this.STREAM_POSE:
+          return this.stream_pose;
+        case this.STREAM_CONFIDENCE:
+          return this.stream_confidence;
       }
     },
 };
@@ -3032,38 +4327,43 @@ const recording_mode = {
    * but pixel data will be replaced with zeros to save space. <br>Equivalent to its uppercase
    * counterpart.
    */
-  blank_frames: 'blank-frames',
+  recording_mode_blank_frames: 'blank-frames',
   /**
    * String literal of <code>'compressed'</code>. <br>Frames will be encoded using a proprietary
    * lossy encoding, aiming at x5 compression at some CPU expense. <br>Equivalent to its uppercase
    * counterpart.
    */
-  compressed: 'compressed',
+  recording_mode_compressed: 'compressed',
   /**
    * String literal of <code>'best-quality'</code>. <br>Frames will not be compressed,
    * but rather stored as-is. This gives best quality and low CPU overhead, but you might run out
    * of memory. <br>Equivalent to its uppercase counterpart.
    */
-  best_quality: 'best-quality',
+  recording_mode_best_quality: 'best-quality',
 
   /**
    * Frame metadata will be recorded, but pixel data will be replaced with zeros to save space.
    * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  BLANK_FRAMES: RS2.RS2_RECORDING_MODE_BLANK_FRAMES,
+  RECORDING_MODE_BLANK_FRAMES: RS2.RS2_RECORDING_MODE_BLANK_FRAMES,
   /**
    * Frames will be encoded using a proprietary lossy encoding, aiming at x5 compression at some
    * CPU expense.<br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  COMPRESSED: RS2.RS2_RECORDING_MODE_COMPRESSED,
+  RECORDING_MODE_COMPRESSED: RS2.RS2_RECORDING_MODE_COMPRESSED,
   /**
    * Frames will not be compressed, but rather stored as-is. This gives best quality and low CPU
    * overhead, but you might run out of memory.<br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  BEST_QUALITY: RS2.RS2_RECORDING_MODE_BEST_QUALITY,
+  RECORDING_MODE_BEST_QUALITY: RS2.RS2_RECORDING_MODE_BEST_QUALITY,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+  */
+  RECORDING_MODE_COUNT: RS2.RS2_RECORDING_MODE_COUNT,
 };
 
 /**
@@ -3238,7 +4538,102 @@ const option = {
    * correction of the motion data . <br>Equivalent to its uppercase counterpart.
    */
   option_enable_motion_correction: 'enable-motion-correction',
+  /**
+   * String literal of <code>'auto-exposure-priority'</code>.
+   * <br>Allows sensor to dynamically ajust the frame rate
+   * depending on lighting conditions <br>Equivalent to its uppercase counterpart
+   */
+  option_auto_exposure_priority: 'auto-exposure-priority',
 
+  /**
+   * String literal of <code>''color-scheme'</code>. <br>Color scheme for data visualization
+   * <br>Equivalent to its uppercase counterpart
+   */
+  option_color_scheme: 'color-scheme',
+
+  /**
+   * String literal of <code>''histogram-equalization-enabled'</code>. <br>Perform histogram
+   * equalization post-processing on the depth data <br>Equivalent to its uppercase counterpart
+   */
+  option_histogram_equalization_enabled: 'histogram-equalization-enabled',
+
+  /**
+   * String literal of <code>''min-distance'</code>. <br>Minimal distance to the target
+   * <br>Equivalent to its uppercase counterpart
+   */
+  option_min_distance: 'min-distance',
+
+  /**
+   * String literal of <code>''max-distance'</code>. <br>Maximum distance to the target
+   * <br>Equivalent to its uppercase counterpart
+   */
+  option_max_distance: 'max-distance',
+  /**
+   * String literal of <code>'texture-source'</code>. <br>Texture mapping stream unique ID
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  option_texture_source: 'texture-source',
+  /**
+   * String literal of <code>'filter-magnitude'</code>. <br>The 2D-filter effect. The specific
+   * interpretation is given within the context of the filter
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  option_filter_magnitude: 'filter-magnitude',
+  /**
+   * String literal of <code>'filter-smooth-alpha'</code>. <br>2D-filter parameter controls
+   * the weight/radius for smoothing.
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  option_filter_smooth_alpha: 'filter-smooth-alpha',
+  /**
+   * String literal of <code>'filter-smooth-delta'</code>. <br>2D-filter range/validity threshold
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  option_filter_smooth_delta: 'filter-smooth-delta',
+  /**
+   * String literal of <code>'holes-fill'</code>. <br>Enhance depth data post-processing
+   * with holes filling where appropriate
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  option_holes_fill: 'holes-fill',
+  /**
+   * String literal of <code>'stereo-baseline'</code>. <br>The distance in mm between the first
+   * and the second imagers in stereo-based depth cameras
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  option_stereo_baseline: 'stereo-baseline',
+  /**
+   * String literal of <code>'auto-exposure-converage-step'</code>. <br>Allows dynamically ajust
+   * the converge step value of the target exposure in Auto-Exposure algorithm
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  option_auto_exposure_converge_step: 'auto-exposure-converge-step',
+  /**
+   * String literal of <code>'inter-cam-sync-mode'. <br>Impose Inter-camera HW synchronization mode.
+   * Applicable for D400/Rolling Shutter SKUs
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  option_inter_cam_sync_mode: 'inter-cam-sync-mode',
+  option_stream_filter: 'stream-filter',
+  option_stream_format_filter: 'stream-format-filter',
+  option_stream_index_filter: 'stream-index-filter',
+  option_emitter_on_off: 'emitter-on-off',
+  option_zero_order_point_x: 'zero-order-point-x',
+  option_zero_order_point_y: 'zero-order-point-y',
+  option_lld_temperature: 'lld-temperature',
+  option_mc_temperature: 'mc-temperature',
+  option_ma_temperature: 'ma-temperature',
+  option_apd_temperature: 'apd-temperature',
+  option_hardware_preset: 'hardware-preset',
+  option_global_time_enabled: 'global-time-enabled',
+  option_enable_mapping: 'enable-mapping',
+  option_enable_relocalization: 'enable-relocalization',
+  option_enable_pose_jumping: 'enable-pose-jumping',
+  option_enable_dynamic_calibration: 'enable-dynamic-calibration',
+  option_depth_offset: 'depth-offset',
+  option_led_power: 'led-power',
+  option_zero_order_enabled: 'zero-order-enabled',
+  option_enable_map_preservation: 'enable-map-preservation',
   /**
    * Enable / disable color backlight compensatio.<br>Equivalent to its lowercase counterpart.
    * @type {Integer}
@@ -3407,6 +4802,105 @@ const option = {
    */
   OPTION_ENABLE_MOTION_CORRECTION: RS2.RS2_OPTION_ENABLE_MOTION_CORRECTION,
   /**
+   * Allows sensor to dynamically ajust the frame rate depending on lighting conditions.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_AUTO_EXPOSURE_PRIORITY: RS2.RS2_OPTION_AUTO_EXPOSURE_PRIORITY,
+
+  /**
+   * Color scheme for data visualization <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_COLOR_SCHEME: RS2.RS2_OPTION_COLOR_SCHEME,
+
+  /**
+   * Perform histogram equalization post-processing on the depth data.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_HISTOGRAM_EQUALIZATION_ENABLED: RS2.RS2_OPTION_HISTOGRAM_EQUALIZATION_ENABLED,
+
+  /**
+   * Minimal distance to the target <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_MIN_DISTANCE: RS2.RS2_OPTION_MIN_DISTANCE,
+
+  /**
+   * Maximum distance to the target <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_MAX_DISTANCE: RS2.RS2_OPTION_MAX_DISTANCE,
+  /**
+   * Texture mapping stream unique ID <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_TEXTURE_SOURCE: RS2.RS2_OPTION_TEXTURE_SOURCE,
+  /**
+   * The 2D-filter effect. The specific interpretation is given within the context of the filter
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_FILTER_MAGNITUDE: RS2.RS2_OPTION_FILTER_MAGNITUDE,
+  /**
+   * 2D-filter parameter controls the weight/radius for smoothing.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_FILTER_SMOOTH_ALPHA: RS2.RS2_OPTION_FILTER_SMOOTH_ALPHA,
+  /**
+   * 2D-filter range/validity threshold<br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_FILTER_SMOOTH_DELTA: RS2.RS2_OPTION_FILTER_SMOOTH_DELTA,
+  /**
+   * Enhance depth data post-processing with holes filling where appropriate
+   * <br> Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  OPTION_HOLES_FILL: RS2.RS2_OPTION_HOLES_FILL,
+  /**
+   * The distance in mm between the first and the second imagers in stereo-based depth cameras
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_STEREO_BASELINE: RS2.RS2_OPTION_STEREO_BASELINE,
+  /**
+   * Allows dynamically ajust the converge step value of the target exposure in Auto-Exposure
+   * algorithm
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_AUTO_EXPOSURE_CONVERGE_STEP: RS2.RS2_OPTION_AUTO_EXPOSURE_CONVERGE_STEP,
+  /**
+   * Impose Inter-camera HW synchronization mode.
+   * Applicable for D400/Rolling Shutter SKUs
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  OPTION_INTER_CAM_SYNC_MODE: RS2.RS2_OPTION_INTER_CAM_SYNC_MODE,
+  OPTION_STREAM_FILTER: RS2.RS2_OPTION_STREAM_FILTER,
+  OPTION_STREAM_FORMAT_FILTER: RS2.RS2_OPTION_STREAM_FORMAT_FILTER,
+  OPTION_STREAM_INDEX_FILTER: RS2.RS2_OPTION_STREAM_INDEX_FILTER,
+  OPTION_EMITTER_ON_OFF: RS2.RS2_OPTION_EMITTER_ON_OFF,
+  OPTION_ZERO_ORDER_POINT_X: RS2.RS2_OPTION_ZERO_ORDER_POINT_X,
+  OPTION_ZERO_ORDER_POINT_Y: RS2.RS2_OPTION_ZERO_ORDER_POINT_Y,
+  OPTION_LLD_TEMPERATURE: RS2.RS2_OPTION_LLD_TEMPERATURE,
+  OPTION_MC_TEMPERATURE: RS2.RS2_OPTION_MC_TEMPERATURE,
+  OPTION_MA_TEMPERATURE: RS2.RS2_OPTION_MA_TEMPERATURE,
+  OPTION_HARDWARE_PRESET: RS2.RS2_OPTION_HARDWARE_PRESET,
+  OPTION_GLOBAL_TIME_ENABLED: RS2.RS2_OPTION_GLOBAL_TIME_ENABLED,
+  OPTION_APD_TEMPERATURE: RS2.RS2_OPTION_APD_TEMPERATURE,
+  OPTION_ENABLE_MAPPING: RS2.RS2_OPTION_ENABLE_MAPPING,
+  OPTION_ENABLE_RELOCALIZATION: RS2.RS2_OPTION_ENABLE_RELOCALIZATION,
+  OPTION_ENABLE_POSE_JUMPING: RS2.RS2_OPTION_ENABLE_POSE_JUMPING,
+  OPTION_ENABLE_DYNAMIC_CALIBRATION: RS2.RS2_OPTION_ENABLE_DYNAMIC_CALIBRATION,
+  OPTION_DEPTH_OFFSET: RS2.RS2_OPTION_DEPTH_OFFSET,
+  OPTION_LED_POWER: RS2.RS2_OPTION_LED_POWER,
+  OPTION_ZERO_ORDER_ENABLED: RS2.RS2_OPTION_ZERO_ORDER_ENABLED,
+  OPTION_ENABLE_MAP_PRESERVATION: RS2.RS2_OPTION_ENABLE_MAP_PRESERVATION,
+  /**
    * Number of enumeration values. Not a valid input: intended to be used in for-loops.
    * @type {Integer}
    */
@@ -3418,76 +4912,139 @@ const option = {
    * @return {String}
    */
   optionToString: function(option) {
-    if (arguments.length !== 1) {
-      throw new TypeError('option.optionToString(option) expects 1 argument');
-    } else {
-      let i = checkStringNumber(arguments[0],
-          this.OPTION_BACKLIGHT_COMPENSATION, this.OPTION_COUNT,
-          option2Int,
-          'option.optionToString(option) expects a number or string as the 1st argument',
-          'option.optionToString(option) expects a valid value as the 1st argument');
-      switch (i) {
-        case this.OPTION_BACKLIGHT_COMPENSATION:
-          return this.option_backlight_compensation;
-        case this.OPTION_BRIGHTNESS:
-          return this.option_brightness;
-        case this.OPTION_CONTRAST:
-          return this.option_contrast;
-        case this.OPTION_EXPOSURE:
-          return this.option_exposure;
-        case this.OPTION_GAIN:
-          return this.option_gain;
-        case this.OPTION_GAMMA:
-          return this.option_gamma;
-        case this.OPTION_HUE:
-          return this.option_hue;
-        case this.OPTION_SATURATION:
-          return this.option_saturation;
-        case this.OPTION_SHARPNESS:
-          return this.option_sharpness;
-        case this.OPTION_WHITE_BALANCE:
-          return this.option_white_balance;
-        case this.OPTION_ENABLE_AUTO_EXPOSURE:
-          return this.option_enable_auto_exposure;
-        case this.OPTION_ENABLE_AUTO_WHITE_BALANCE:
-          return this.option_enable_auto_white_balance;
-        case this.OPTION_VISUAL_PRESET:
-          return this.option_visual_preset;
-        case this.OPTION_LASER_POWER:
-          return this.option_laser_power;
-        case this.OPTION_ACCURACY:
-          return this.option_accuracy;
-        case this.OPTION_MOTION_RANGE:
-          return this.option_motion_range;
-        case this.OPTION_FILTER_OPTION:
-          return this.option_filter_option;
-        case this.OPTION_CONFIDENCE_THRESHOLD:
-          return this.option_confidence_threshold;
-        case this.OPTION_EMITTER_ENABLED:
-          return this.option_emitter_enabled;
-        case this.OPTION_FRAMES_QUEUE_SIZE:
-          return this.option_frames_queue_size;
-        case this.OPTION_TOTAL_FRAME_DROPS:
-          return this.option_total_frame_drops;
-        case this.OPTION_AUTO_EXPOSURE_MODE:
-          return this.option_auto_exposure_mode;
-        case this.OPTION_POWER_LINE_FREQUENCY:
-          return this.option_power_line_frequency;
-        case this.OPTION_ASIC_TEMPERATURE:
-          return this.option_asic_temperature;
-        case this.OPTION_ERROR_POLLING_ENABLED:
-          return this.option_error_polling_enabled;
-        case this.OPTION_PROJECTOR_TEMPERATURE:
-          return this.option_projector_temperature;
-        case this.OPTION_OUTPUT_TRIGGER_ENABLED:
-          return this.option_output_trigger_enabled;
-        case this.OPTION_MOTION_MODULE_TEMPERATURE:
-          return this.option_motion_module_temperature;
-        case this.OPTION_DEPTH_UNITS:
-          return this.option_depth_units;
-        case this.OPTION_ENABLE_MOTION_CORRECTION:
-          return this.option_enable_motion_correction;
-      }
+    const funcName = 'option.optionToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.option, 0, funcName);
+    switch (i) {
+      case this.OPTION_BACKLIGHT_COMPENSATION:
+        return this.option_backlight_compensation;
+      case this.OPTION_BRIGHTNESS:
+        return this.option_brightness;
+      case this.OPTION_CONTRAST:
+        return this.option_contrast;
+      case this.OPTION_EXPOSURE:
+        return this.option_exposure;
+      case this.OPTION_GAIN:
+        return this.option_gain;
+      case this.OPTION_GAMMA:
+        return this.option_gamma;
+      case this.OPTION_HUE:
+        return this.option_hue;
+      case this.OPTION_SATURATION:
+        return this.option_saturation;
+      case this.OPTION_SHARPNESS:
+        return this.option_sharpness;
+      case this.OPTION_WHITE_BALANCE:
+        return this.option_white_balance;
+      case this.OPTION_ENABLE_AUTO_EXPOSURE:
+        return this.option_enable_auto_exposure;
+      case this.OPTION_ENABLE_AUTO_WHITE_BALANCE:
+        return this.option_enable_auto_white_balance;
+      case this.OPTION_VISUAL_PRESET:
+        return this.option_visual_preset;
+      case this.OPTION_LASER_POWER:
+        return this.option_laser_power;
+      case this.OPTION_ACCURACY:
+        return this.option_accuracy;
+      case this.OPTION_MOTION_RANGE:
+        return this.option_motion_range;
+      case this.OPTION_FILTER_OPTION:
+        return this.option_filter_option;
+      case this.OPTION_CONFIDENCE_THRESHOLD:
+        return this.option_confidence_threshold;
+      case this.OPTION_EMITTER_ENABLED:
+        return this.option_emitter_enabled;
+      case this.OPTION_FRAMES_QUEUE_SIZE:
+        return this.option_frames_queue_size;
+      case this.OPTION_TOTAL_FRAME_DROPS:
+        return this.option_total_frame_drops;
+      case this.OPTION_AUTO_EXPOSURE_MODE:
+        return this.option_auto_exposure_mode;
+      case this.OPTION_POWER_LINE_FREQUENCY:
+        return this.option_power_line_frequency;
+      case this.OPTION_ASIC_TEMPERATURE:
+        return this.option_asic_temperature;
+      case this.OPTION_ERROR_POLLING_ENABLED:
+        return this.option_error_polling_enabled;
+      case this.OPTION_PROJECTOR_TEMPERATURE:
+        return this.option_projector_temperature;
+      case this.OPTION_OUTPUT_TRIGGER_ENABLED:
+        return this.option_output_trigger_enabled;
+      case this.OPTION_MOTION_MODULE_TEMPERATURE:
+        return this.option_motion_module_temperature;
+      case this.OPTION_DEPTH_UNITS:
+        return this.option_depth_units;
+      case this.OPTION_ENABLE_MOTION_CORRECTION:
+        return this.option_enable_motion_correction;
+      case this.OPTION_AUTO_EXPOSURE_PRIORITY:
+        return this.option_auto_exposure_priority;
+      case this.OPTION_COLOR_SCHEME:
+        return this.option_color_scheme;
+      case this.OPTION_HISTOGRAM_EQUALIZATION_ENABLED:
+        return this.option_histogram_equalization_enabled;
+      case this.OPTION_MIN_DISTANCE:
+        return this.option_min_distance;
+      case this.OPTION_MAX_DISTANCE:
+        return this.option_max_distance;
+      case this.OPTION_TEXTURE_SOURCE:
+        return this.option_texture_source;
+      case this.OPTION_FILTER_MAGNITUDE:
+        return this.option_filter_magnitude;
+      case this.OPTION_FILTER_SMOOTH_ALPHA:
+        return this.option_filter_smooth_alpha;
+      case this.OPTION_FILTER_SMOOTH_DELTA:
+        return this.option_filter_smooth_delta;
+      case this.OPTION_HOLES_FILL:
+        return this.option_holes_fill;
+      case this.OPTION_STEREO_BASELINE:
+        return this.option_stereo_baseline;
+      case this.OPTION_AUTO_EXPOSURE_CONVERGE_STEP:
+        return this.option_auto_exposure_converge_step;
+      case this.OPTION_INTER_CAM_SYNC_MODE:
+        return this.option_inter_cam_sync_mode;
+      case this.OPTION_STREAM_FILTER:
+        return this.option_stream_filter;
+      case this.OPTION_STREAM_FORMAT_FILTER:
+        return this.option_stream_format_filter;
+      case this.OPTION_STREAM_INDEX_FILTER:
+        return this.option_stream_index_filter;
+      case this.OPTION_EMITTER_ON_OFF:
+        return this.option_emitter_on_off;
+      case this.OPTION_ZERO_ORDER_POINT_X:
+        return this.option_zero_order_point_x;
+      case this.OPTION_ZERO_ORDER_POINT_Y:
+        return this.option_zero_order_point_y;
+      case this.OPTION_LLD_TEMPERATURE:
+        return this.option_lld_temperature;
+      case this.OPTION_MC_TEMPERATURE:
+        return this.option_mc_temperature;
+      case this.OPTION_MA_TEMPERATURE:
+        return this.option_ma_temperature;
+      case this.OPTION_HARDWARE_PRESET:
+        return this.option_hardware_preset;
+      case this.OPTION_GLOBAL_TIME_ENABLED:
+        return this.option_global_time_enabled;
+      case this.OPTION_APD_TEMPERATURE:
+        return this.option_apd_temperature;
+      case this.OPTION_ENABLE_MAPPING:
+        return this.option_enable_mapping;
+      case this.OPTION_ENABLE_RELOCALIZATION:
+        return this.option_enable_relocalization;
+      case this.OPTION_ENABLE_POSE_JUMPING:
+        return this.option_enable_pose_jumping;
+      case this.OPTION_ENABLE_DYNAMIC_CALIBRATION:
+        return this.option_enable_dynamic_calibration;
+      case this.OPTION_DEPTH_OFFSET:
+        return this.option_depth_offset;
+      case this.OPTION_LED_POWER:
+        return this.option_led_power;
+      case this.OPTION_ZERO_ORDER_ENABLED:
+        return this.option_zero_order_enabled;
+      case this.OPTION_ENABLE_MAP_PRESERVATION:
+        return this.option_enable_map_preservation;
+      default:
+        throw new TypeError(
+            'option.optionToString(option) expects a valid value as the 1st argument');
     }
   },
 };
@@ -3517,6 +5074,11 @@ const camera_info = {
    */
   camera_info_firmware_version: 'firmware-version',
   /**
+   * String literal of <code>'recommended-firmware-version'</code>. <br>Latest firmware version
+   * available. <br>Equivalent to its uppercase counterpart.
+   */
+  camera_info_recommended_firmware_version: 'recommended-firmware-version',
+  /**
    * String literal of <code>'port'</code>. <br>Unique identifier of the port the device is
    * connected to (platform specific). <br>Equivalent to its uppercase counterpart.
    *
@@ -3545,7 +5107,11 @@ const camera_info = {
    * <br>Equivalent to its uppercase counterpart.
    */
   camera_info_camera_locked: 'camera-locked',
-
+  /**
+   * String literal of <code>'usb-type-descriptor'</code>. <br>Designated USB specification:
+   * USB2/USB3. <br>Equivalent to its uppercase counterpart.
+   */
+  camera_info_usb_type_descriptor: 'usb-type-descriptor',
   /**
    * Device friendly name. <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
@@ -3561,6 +5127,11 @@ const camera_info = {
    * @type {Integer}
    */
   CAMERA_INFO_FIRMWARE_VERSION: RS2.RS2_CAMERA_INFO_FIRMWARE_VERSION,
+  /**
+   * Latest firmware version available. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  CAMERA_INFO_RECOMMENDED_FIRMWARE_VERSION: RS2.RS2_CAMERA_INFO_RECOMMENDED_FIRMWARE_VERSION,
   /**
    * Unique identifier of the port the device is connected to (platform specific). <br>Equivalent to
    * its lowercase counterpart.
@@ -3588,7 +5159,11 @@ const camera_info = {
    * @type {Integer}
    */
   CAMERA_INFO_CAMERA_LOCKED: RS2.RS2_CAMERA_INFO_CAMERA_LOCKED,
-
+  /**
+   * Designated USB specification: USB2/USB3. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  CAMERA_INFO_USB_TYPE_DESCRIPTOR: RS2.RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR,
   /**
    * Number of enumeration values. Not a valid input: intended to be used in for-loops.
    * @type {Integer}
@@ -3601,32 +5176,30 @@ const camera_info = {
    * @return {String}
    */
   cameraInfoToString: function(info) {
-    if (arguments.length !== 1) {
-      throw new TypeError('camera_info.cameraInfoToString(info) expects 1 argument');
-    } else {
-      let i = checkStringNumber(arguments[0],
-          this.CAMERA_INFO_NAME, this.CAMERA_INFO_COUNT,
-          cameraInfo2Int,
-          'camera_info.cameraInfoToString(info) expects a number or string as the 1st argument',
-          'camera_info.cameraInfoToString(info) expects a valid value as the 1st argument');
-      switch (i) {
-        case this.CAMERA_INFO_NAME:
-          return this.camera_info_name;
-        case this.CAMERA_INFO_SERIAL_NUMBER:
-          return this.camera_info_serial_number;
-        case this.CAMERA_INFO_FIRMWARE_VERSION:
-          return this.camera_info_firmware_version;
-        case this.CAMERA_INFO_PHYSICAL_PORT:
-          return this.camera_info_physical_port;
-        case this.CAMERA_INFO_DEBUG_OP_CODE:
-          return this.camera_info_debug_op_code;
-        case this.CAMERA_INFO_ADVANCED_MODE:
-          return this.camera_info_advanced_mode;
-        case this.CAMERA_INFO_PRODUCT_ID:
-          return this.camera_info_product_id;
-        case this.CAMERA_INFO_CAMERA_LOCKED:
-          return this.camera_info_camera_locked;
-      }
+    const funcName = 'camera_info.cameraInfoToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.camera_info, 0, funcName);
+    switch (i) {
+      case this.CAMERA_INFO_NAME:
+        return this.camera_info_name;
+      case this.CAMERA_INFO_SERIAL_NUMBER:
+        return this.camera_info_serial_number;
+      case this.CAMERA_INFO_FIRMWARE_VERSION:
+        return this.camera_info_firmware_version;
+      case this.CAMERA_INFO_PHYSICAL_PORT:
+        return this.camera_info_physical_port;
+      case this.CAMERA_INFO_DEBUG_OP_CODE:
+        return this.camera_info_debug_op_code;
+      case this.CAMERA_INFO_ADVANCED_MODE:
+        return this.camera_info_advanced_mode;
+      case this.CAMERA_INFO_PRODUCT_ID:
+        return this.camera_info_product_id;
+      case this.CAMERA_INFO_CAMERA_LOCKED:
+        return this.camera_info_camera_locked;
+      case this.CAMERA_INFO_USB_TYPE_DESCRIPTOR:
+        return this.camera_info_usb_type_descriptor;
+      case this.CAMERA_INFO_RECOMMENDED_FIRMWARE_VERSION:
+        return this.camera_info_recommended_firmware_version;
     }
   },
 };
@@ -3638,138 +5211,406 @@ const camera_info = {
  * @see [Frame.supportsFrameMetadata()]{@link Frame#supportsFrameMetadata}
  */
 const frame_metadata = {
-    /**
-     * String literal of <code>'frame-counter'</code>. <br>A sequential index managed
-     * per-stream. Integer value <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_frame_counter: 'frame-counter',
-    /**
-     * String literal of <code>'frame-timestamp'</code>. <br>Timestamp set by device
-     * clock when data readout and transmit commence. usec <br>Equivalent to its uppercase
-     * counterpart
-     */
-    frame_metadata_frame_timestamp: 'frame-timestamp',
-    /**
-     * String literal of <code>'sensor-timestamp'</code>. <br>Timestamp of the middle
-     * of sensor's exposure calculated by device. usec <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_sensor_timestamp: 'sensor-timestamp',
-    /**
-     * String literal of <code>'actual-exposure'</code>. <br>Sensor's exposure width.
-     * When Auto Exposure (AE) is on the value is controlled by firmware. usec <br>Equivalent to
-     * its uppercase counterpart
-     */
-    frame_metadata_actual_exposure: 'actual-exposure',
-    /**
-     * String literal of <code>'gain-level'</code>. <br>A relative value increasing
-     * which will increase the Sensor's gain factor. When AE is set On, the value is controlled by
-     * firmware. Integer value <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_gain_level: 'gain-level',
-    /**
-     * String literal of <code>'auto-exposure'</code>. <br>Auto Exposure Mode
-     * indicator. Zero corresponds to AE switched off.  <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_auto_exposure: 'auto-exposure',
-    /**
-     * String literal of <code>'white-balance'</code>. <br>White Balance setting as a
-     * color temperature. Kelvin degrees <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_white_balance: 'white-balance',
-    /**
-     * String literal of <code>'time-of-arrival'</code>. <br>Time of arrival in
-     * system clock  <br>Equivalent to its uppercase counterpart
-     */
-    frame_metadata_time_of_arrival: 'time-of-arrival',
-    /**
-     * A sequential index managed per-stream. Integer value <br>Equivalent to its lowercase
-     * counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_FRAME_COUNTER: RS2.RS2_FRAME_METADATA_FRAME_COUNTER,
-    /**
-     * Timestamp set by device clock when data readout and transmit commence. usec <br>Equivalent
-     * to its lowercase counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_FRAME_TIMESTAMP: RS2.RS2_FRAME_METADATA_FRAME_TIMESTAMP,
-    /**
-     * Timestamp of the middle of sensor's exposure calculated by device. usec <br>Equivalent to
-     * its lowercase counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_SENSOR_TIMESTAMP: RS2.RS2_FRAME_METADATA_SENSOR_TIMESTAMP,
-    /**
-     * Sensor's exposure width. When Auto Exposure (AE) is on the value is controlled by
-     * firmware. usec <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_ACTUAL_EXPOSURE: RS2.RS2_FRAME_METADATA_ACTUAL_EXPOSURE,
-    /**
-     * A relative value increasing which will increase the Sensor's gain factor. When AE is set
-     * On, the value is controlled by firmware. Integer value <br>Equivalent to its lowercase
-     * counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_GAIN_LEVEL: RS2.RS2_FRAME_METADATA_GAIN_LEVEL,
-    /**
-     * Auto Exposure Mode indicator. Zero corresponds to AE switched off.  <br>Equivalent to its
-     * lowercase counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_AUTO_EXPOSURE: RS2.RS2_FRAME_METADATA_AUTO_EXPOSURE,
-    /**
-     * White Balance setting as a color temperature. Kelvin degrees <br>Equivalent to its lowercase
-     * counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_WHITE_BALANCE: RS2.RS2_FRAME_METADATA_WHITE_BALANCE,
-    /**
-     * Time of arrival in system clock  <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    FRAME_METADATA_TIME_OF_ARRIVAL: RS2.RS2_FRAME_METADATA_TIME_OF_ARRIVAL,
-    /**
-     * Number of enumeration values. Not a valid input: intended to be used in for-loops.
-     * @type {Integer}
-     */
-    FRAME_METADATA_COUNT: RS2.RS2_FRAME_METADATA_COUNT,
+  /**
+   * String literal of <code>'frame-counter'</code>. <br>A sequential index managed
+   * per-stream. Integer value <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_frame_counter: 'frame-counter',
+  /**
+   * String literal of <code>'frame-timestamp'</code>. <br>Timestamp set by device
+   * clock when data readout and transmit commence. usec <br>Equivalent to its uppercase
+   * counterpart
+   */
+  frame_metadata_frame_timestamp: 'frame-timestamp',
+  /**
+   * String literal of <code>'sensor-timestamp'</code>. <br>Timestamp of the middle
+   * of sensor's exposure calculated by device. usec <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_sensor_timestamp: 'sensor-timestamp',
+  /**
+   * String literal of <code>'actual-exposure'</code>. <br>Sensor's exposure width.
+   * When Auto Exposure (AE) is on the value is controlled by firmware. usec <br>Equivalent to
+   * its uppercase counterpart
+   */
+  frame_metadata_actual_exposure: 'actual-exposure',
+  /**
+   * String literal of <code>'gain-level'</code>. <br>A relative value increasing
+   * which will increase the Sensor's gain factor. When AE is set On, the value is controlled by
+   * firmware. Integer value <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_gain_level: 'gain-level',
+  /**
+   * String literal of <code>'auto-exposure'</code>. <br>Auto Exposure Mode
+   * indicator. Zero corresponds to AE switched off.  <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_auto_exposure: 'auto-exposure',
+  /**
+   * String literal of <code>'white-balance'</code>. <br>White Balance setting as a
+   * color temperature. Kelvin degrees <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_white_balance: 'white-balance',
+  /**
+   * String literal of <code>'time-of-arrival'</code>. <br>Time of arrival in
+   * system clock  <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_time_of_arrival: 'time-of-arrival',
+  /**
+   * Temperature of the device, measured at the time of the frame capture. Celsius degrees
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_temperature: 'temperature',
+  /**
+   * Timestamp get from uvc driver. usec
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_backend_timestamp: 'backend-timestamp',
+  /**
+   * Actual fps
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_actual_fps: 'actual-fps',
+  /**
+   * Laser power value 0-360.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_frame_laser_power: 'frame-laser-power',
+  /**
+   * Laser power mode. Zero corresponds to Laser power switched off and one for switched on.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_frame_laser_power_mode: 'frame-laser-power-mode',
+  /**
+   * Exposure priority.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_exposure_priority: 'exposure-priority',
+  /**
+   * Left region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_exposure_roi_left: 'exposure-roi-left',
+  /**
+   * Right region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_exposure_roi_right: 'exposure-roi-right',
+  /**
+   * Top region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_exposure_roi_top: 'exposure-roi-top',
+  /**
+   * Bottom region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_exposure_roi_bottom: 'exposure-roi-bottom',
+  /**
+   * Color image brightness.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_brightness: 'brightness',
+  /**
+   * Color image contrast.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_contrast: 'contrast',
+  /**
+   * Color image saturation.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_saturation: 'saturation',
+  /**
+   * Color image sharpness.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_sharpness: 'sharpness',
+  /**
+   * Auto white balance temperature Mode indicator. Zero corresponds to automatic mode switched off.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_auto_white_balance_temperature: 'auto-white-balance-temperature',
+  /**
+   * Color backlight compensation. Zero corresponds to switched off.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_backlight_compensation: 'backlight-compensation',
+  /**
+   * Color image hue.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_hue: 'hue',
+  /**
+   * Color image gamma.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_gamma: 'gamma',
+  /**
+   * Color image white balance.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_manual_white_balance: 'manual-white-balance',
+  /**
+   * Power Line Frequency for anti-flickering Off/50Hz/60Hz/Auto.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_power_line_frequency: 'power-line-frequency',
+  /**
+   * Color lowlight compensation. Zero corresponds to switched off.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  frame_metadata_low_light_compensation: 'low-light-compensation',
+  /**
+   * A sequential index managed per-stream. Integer value <br>Equivalent to its lowercase
+   * counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_FRAME_COUNTER: RS2.RS2_FRAME_METADATA_FRAME_COUNTER,
+  /**
+   * Timestamp set by device clock when data readout and transmit commence. usec <br>Equivalent
+   * to its lowercase counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_FRAME_TIMESTAMP: RS2.RS2_FRAME_METADATA_FRAME_TIMESTAMP,
+  /**
+   * Timestamp of the middle of sensor's exposure calculated by device. usec <br>Equivalent to
+   * its lowercase counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_SENSOR_TIMESTAMP: RS2.RS2_FRAME_METADATA_SENSOR_TIMESTAMP,
+  /**
+   * Sensor's exposure width. When Auto Exposure (AE) is on the value is controlled by
+   * firmware. usec <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_ACTUAL_EXPOSURE: RS2.RS2_FRAME_METADATA_ACTUAL_EXPOSURE,
+  /**
+   * A relative value increasing which will increase the Sensor's gain factor. When AE is set
+   * On, the value is controlled by firmware. Integer value <br>Equivalent to its lowercase
+   * counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_GAIN_LEVEL: RS2.RS2_FRAME_METADATA_GAIN_LEVEL,
+  /**
+   * Auto Exposure Mode indicator. Zero corresponds to AE switched off.  <br>Equivalent to its
+   * lowercase counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_AUTO_EXPOSURE: RS2.RS2_FRAME_METADATA_AUTO_EXPOSURE,
+  /**
+   * White Balance setting as a color temperature. Kelvin degrees <br>Equivalent to its lowercase
+   * counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_WHITE_BALANCE: RS2.RS2_FRAME_METADATA_WHITE_BALANCE,
+  /**
+   * Time of arrival in system clock  <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  FRAME_METADATA_TIME_OF_ARRIVAL: RS2.RS2_FRAME_METADATA_TIME_OF_ARRIVAL,
+  /**
+   * Temperature of the device, measured at the time of the frame capture. Celsius degrees
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_TEMPERATURE: RS2.RS2_FRAME_METADATA_TEMPERATURE,
+  /**
+  * Timestamp get from uvc driver. usec
+  * <br>Equivalent to its lowercase counterpart
+  * @type {Integer}
+  */
+  FRAME_METADATA_BACKEND_TIMESTAMP: RS2.RS2_FRAME_METADATA_BACKEND_TIMESTAMP,
+  /**
+  * Actual fps
+  * <br>Equivalent to its lowercase counterpart
+  * @type {Integer}
+  */
+  FRAME_METADATA_ACTUAL_FPS: RS2.RS2_FRAME_METADATA_ACTUAL_FPS,
+  /**
+   * Laser power value 0-360.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_FRAME_LASER_POWER: RS2.RS2_FRAME_METADATA_FRAME_LASER_POWER,
+  /**
+   * Laser power mode. Zero corresponds to Laser power switched off and one for switched on.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_FRAME_LASER_POWER_MODE: RS2.RS2_FRAME_METADATA_FRAME_LASER_POWER_MODE,
+  /**
+   * Exposure priority.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_EXPOSURE_PRIORITY: RS2.RS2_FRAME_METADATA_EXPOSURE_PRIORITY,
+  /**
+   * Left region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_EXPOSURE_ROI_LEFT: RS2.RS2_FRAME_METADATA_EXPOSURE_ROI_LEFT,
+  /**
+   * Right region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_EXPOSURE_ROI_RIGHT: RS2.RS2_FRAME_METADATA_EXPOSURE_ROI_RIGHT,
+  /**
+   * Top region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_EXPOSURE_ROI_TOP: RS2.RS2_FRAME_METADATA_EXPOSURE_ROI_TOP,
+  /**
+   * Bottom region of interest for the auto exposure Algorithm.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_EXPOSURE_ROI_BOTTOM: RS2.RS2_FRAME_METADATA_EXPOSURE_ROI_BOTTOM,
+  /**
+   * Color image brightness.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_BRIGHTNESS: RS2.RS2_FRAME_METADATA_BRIGHTNESS,
+  /**
+   * Color image contrast.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_CONTRAST: RS2.RS2_FRAME_METADATA_CONTRAST,
+  /**
+   * Color image saturation.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_SATURATION: RS2.RS2_FRAME_METADATA_SATURATION,
+  /**
+   * Color image sharpness.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_SHARPNESS: RS2.RS2_FRAME_METADATA_SHARPNESS,
+  /**
+   * Auto white balance temperature Mode indicator. Zero corresponds to automatic mode switched off.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_AUTO_WHITE_BALANCE_TEMPERATURE:
+      RS2.RS2_FRAME_METADATA_AUTO_WHITE_BALANCE_TEMPERATURE,
+  /**
+   * Color backlight compensation. Zero corresponds to switched off.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_BACKLIGHT_COMPENSATION: RS2.RS2_FRAME_METADATA_BACKLIGHT_COMPENSATION,
+  /**
+   * Color image hue.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_HUE: RS2.RS2_FRAME_METADATA_HUE,
+  /**
+   * Color image gamma.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_GAMMA: RS2.RS2_FRAME_METADATA_GAMMA,
+  /**
+   * Color image white balance.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_MANUAL_WHITE_BALANCE: RS2.RS2_FRAME_METADATA_MANUAL_WHITE_BALANCE,
+  /**
+   * Power Line Frequency for anti-flickering Off/50Hz/60Hz/Auto.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_POWER_LINE_FREQUENCY: RS2.RS2_FRAME_METADATA_POWER_LINE_FREQUENCY,
+  /**
+   * Color lowlight compensation. Zero corresponds to switched off.
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  FRAME_METADATA_LOW_LIGHT_COMPENSATION: RS2.RS2_FRAME_METADATA_LOW_LIGHT_COMPENSATION,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  FRAME_METADATA_COUNT: RS2.RS2_FRAME_METADATA_COUNT,
 
-    /**
-     * Get the string representation out of the integer frame metadata type
-     * @param {Integer} metadata the frame metadata type
-     * @return {String}
-     */
-    frameMetadataToString: function(metadata) {
-      if (arguments.length !== 1) {
-        throw new TypeError('frame_metadata.frameMetadataToString() expects 1 argument');
-      } else {
-        let i = checkStringNumber(arguments[0],
-            this.FRAME_METADATA_FRAME_COUNTER, this.FRAME_METADATA_COUNT,
-            frameMetadata2Int,
-            'frame_metadata.frameMetadataToString() expects a number or string as the 1st argument',
-            'frame_metadata.frameMetadataToString() expects a valid value as the 1st argument');
-        switch (i) {
-          case this.FRAME_METADATA_FRAME_COUNTER:
-            return this.frame_metadata_frame_counter;
-          case this.FRAME_METADATA_FRAME_TIMESTAMP:
-            return this.frame_metadata_frame_timestamp;
-          case this.FRAME_METADATA_SENSOR_TIMESTAMP:
-            return this.frame_metadata_sensor_timestamp;
-          case this.FRAME_METADATA_ACTUAL_EXPOSURE:
-            return this.frame_metadata_actual_exposure;
-          case this.FRAME_METADATA_GAIN_LEVEL:
-            return this.frame_metadata_gain_level;
-          case this.FRAME_METADATA_AUTO_EXPOSURE:
-            return this.frame_metadata_auto_exposure;
-          case this.FRAME_METADATA_WHITE_BALANCE:
-            return this.frame_metadata_white_balance;
-          case this.FRAME_METADATA_TIME_OF_ARRIVAL:
-            return this.frame_metadata_time_of_arrival;
-        }
-      }
-    },
-  };
+  /**
+   * Get the string representation out of the integer frame metadata type
+   * @param {Integer} metadata the frame metadata type
+   * @return {String}
+   */
+  frameMetadataToString: function(metadata) {
+    const funcName = 'frame_metadata.frameMetadataToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.frame_metadata, 0, funcName);
+    switch (i) {
+      case this.FRAME_METADATA_FRAME_COUNTER:
+        return this.frame_metadata_frame_counter;
+      case this.FRAME_METADATA_FRAME_TIMESTAMP:
+        return this.frame_metadata_frame_timestamp;
+      case this.FRAME_METADATA_SENSOR_TIMESTAMP:
+        return this.frame_metadata_sensor_timestamp;
+      case this.FRAME_METADATA_ACTUAL_EXPOSURE:
+        return this.frame_metadata_actual_exposure;
+      case this.FRAME_METADATA_GAIN_LEVEL:
+        return this.frame_metadata_gain_level;
+      case this.FRAME_METADATA_AUTO_EXPOSURE:
+        return this.frame_metadata_auto_exposure;
+      case this.FRAME_METADATA_WHITE_BALANCE:
+        return this.frame_metadata_white_balance;
+      case this.FRAME_METADATA_TIME_OF_ARRIVAL:
+        return this.frame_metadata_time_of_arrival;
+      case this.FRAME_METADATA_TEMPERATURE:
+        return this.frame_metadata_temperature;
+      case this.FRAME_METADATA_BACKEND_TIMESTAMP:
+        return this.frame_metadata_backend_timestamp;
+      case this.FRAME_METADATA_ACTUAL_FPS:
+        return this.frame_metadata_actual_fps;
+      case this.FRAME_METADATA_FRAME_LASER_POWER:
+        return this.frame_metadata_frame_laser_power;
+      case this.FRAME_METADATA_FRAME_LASER_POWER_MODE:
+        return this.frame_metadata_frame_laser_power_mode;
+      case this.FRAME_METADATA_EXPOSURE_PRIORITY:
+        return this.frame_metadata_exposure_priority;
+      case this.FRAME_METADATA_EXPOSURE_ROI_LEFT:
+        return this.frame_metadata_exposure_roi_left;
+      case this.FRAME_METADATA_EXPOSURE_ROI_RIGHT:
+        return this.frame_metadata_exposure_roi_right;
+      case this.FRAME_METADATA_EXPOSURE_ROI_TOP:
+        return this.frame_metadata_exposure_roi_top;
+      case this.FRAME_METADATA_EXPOSURE_ROI_BOTTOM:
+        return this.frame_metadata_exposure_roi_bottom;
+      case this.FRAME_METADATA_BRIGHTNESS:
+        return this.frame_metadata_brightness;
+      case this.FRAME_METADATA_CONTRAST:
+        return this.frame_metadata_contrast;
+      case this.FRAME_METADATA_SATURATION:
+        return this.frame_metadata_saturation;
+      case this.FRAME_METADATA_SHARPNESS:
+        return this.frame_metadata_sharpness;
+      case this.FRAME_METADATA_AUTO_WHITE_BALANCE_TEMPERATURE:
+        return this.frame_metadata_auto_white_balance_temperature;
+      case this.FRAME_METADATA_BACKLIGHT_COMPENSATION:
+        return this.frame_metadata_backlight_compensation;
+      case this.FRAME_METADATA_HUE:
+        return this.frame_metadata_hue;
+      case this.FRAME_METADATA_GAMMA:
+        return this.frame_metadata_gamma;
+      case this.FRAME_METADATA_MANUAL_WHITE_BALANCE:
+        return this.frame_metadata_manual_white_balance;
+      case this.FRAME_METADATA_POWER_LINE_FREQUENCY:
+        return this.frame_metadata_power_line_frequency;
+      case this.FRAME_METADATA_LOW_LIGHT_COMPENSATION:
+        return this.frame_metadata_low_light_compensation;
+    }
+  },
+};
 
 /**
  * Enum for distortion types
@@ -3777,91 +5618,85 @@ const frame_metadata = {
  * @enum {String}
  */
 const distortion = {
-    /**
-     * String literal of <code>'none'</code>. <br>Rectilinear images. No distortion compensation
-     * required. <br> Equivalent to its uppercase counterpart.
-     */
-    distortion_none: 'none',
-    /**
-     * String literal of <code>'modified-brown-conrady'</code>. <br>Equivalent to Brown-Conrady
-     * distortion, except that tangential distortion is applied to radially distorted points
-     * <br> Equivalent to its uppercase counterpart.
-     */
-    distortion_modified_brown_conrady: 'modified-brown-conrady',
-    /**
-     * String literal of <code>'inverse-brown-conrady'</code>. <br>Equivalent to Brown-Conrady
-     * distortion, except undistorts image instead of distorting it
-     * <br> Equivalent to its uppercase counterpart.
-     */
-    distortion_inverse_brown_conrady: 'inverse-brown-conrady',
-    /**
-     * String literal of <code>'ftheta'</code>. <br>F-Theta fish-eye distortion model
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    distortion_ftheta: 'ftheta',
-    /**
-     * String literal of <code>'brown-conrady'</code>. <br>Unmodified Brown-Conrady distortion
-     * model <br> Equivalent to its uppercase counterpart.
-     */
-    distortion_brown_conrady: 'brown-conrady',
+  /**
+   * String literal of <code>'none'</code>. <br>Rectilinear images. No distortion compensation
+   * required. <br> Equivalent to its uppercase counterpart.
+   */
+  distortion_none: 'none',
+  /**
+   * String literal of <code>'modified-brown-conrady'</code>. <br>Equivalent to Brown-Conrady
+   * distortion, except that tangential distortion is applied to radially distorted points
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  distortion_modified_brown_conrady: 'modified-brown-conrady',
+  /**
+   * String literal of <code>'inverse-brown-conrady'</code>. <br>Equivalent to Brown-Conrady
+   * distortion, except undistorts image instead of distorting it
+   * <br> Equivalent to its uppercase counterpart.
+   */
+  distortion_inverse_brown_conrady: 'inverse-brown-conrady',
+  /**
+   * String literal of <code>'ftheta'</code>. <br>F-Theta fish-eye distortion model
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  distortion_ftheta: 'ftheta',
+  /**
+   * String literal of <code>'brown-conrady'</code>. <br>Unmodified Brown-Conrady distortion
+   * model <br> Equivalent to its uppercase counterpart.
+   */
+  distortion_brown_conrady: 'brown-conrady',
 
-    /** Rectilinear images. No distortion compensation required. <br>Equivalent to its lowercase
-     * counterpart
-     * @type {Integer}
-     */
-    DISTORTION_NONE: RS2.RS2_DISTORTION_NONE,
-    /** Equivalent to Brown-Conrady distortion, except that tangential distortion is applied to
-     * radially distorted points <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    DISTORTION_MODIFIED_BROWN_CONRADY: RS2.RS2_DISTORTION_MODIFIED_BROWN_CONRADY,
-    /** Equivalent to Brown-Conrady distortion, except undistorts image instead of distorting it
-     * <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    DISTORTION_INVERSE_BROWN_CONRADY: RS2.RS2_DISTORTION_INVERSE_BROWN_CONRADY,
-    /** F-Theta fish-eye distortion model <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    DISTORTION_FTHETA: RS2.RS2_DISTORTION_FTHETA,
-    /** Unmodified Brown-Conrady distortion model <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    DISTORTION_BROWN_CONRADY: RS2.RS2_DISTORTION_BROWN_CONRADY,
-    /**
-     * Number of enumeration values. Not a valid input: intended to be used in for-loops.
-     * @type {Integer}
-     */
-    DISTORTION_COUNT: RS2.RS2_DISTORTION_COUNT,
+  /** Rectilinear images. No distortion compensation required. <br>Equivalent to its lowercase
+   * counterpart
+   * @type {Integer}
+   */
+  DISTORTION_NONE: RS2.RS2_DISTORTION_NONE,
+  /** Equivalent to Brown-Conrady distortion, except that tangential distortion is applied to
+   * radially distorted points <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  DISTORTION_MODIFIED_BROWN_CONRADY: RS2.RS2_DISTORTION_MODIFIED_BROWN_CONRADY,
+  /** Equivalent to Brown-Conrady distortion, except undistorts image instead of distorting it
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  DISTORTION_INVERSE_BROWN_CONRADY: RS2.RS2_DISTORTION_INVERSE_BROWN_CONRADY,
+  /** F-Theta fish-eye distortion model <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  DISTORTION_FTHETA: RS2.RS2_DISTORTION_FTHETA,
+  /** Unmodified Brown-Conrady distortion model <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  DISTORTION_BROWN_CONRADY: RS2.RS2_DISTORTION_BROWN_CONRADY,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  DISTORTION_COUNT: RS2.RS2_DISTORTION_COUNT,
 
-    /**
-     * Get the string representation out of the integer distortion type
-     * @param {Integer} distortionVal the distortion type
-     * @return {String}
-     */
-    distortionToString: function(distortionVal) {
-      if (arguments.length !== 1) {
-        throw new TypeError('distortion.distortionToString() expects 1 argument');
-      } else {
-        let i = checkStringNumber(arguments[0],
-            this.DISTORTION_NONE, this.DISTORTION_COUNT,
-            distortion2Int,
-            'distortion.distortionToString() expects a number or string as the 1st argument',
-            'distortion.distortionToString() expects a valid value as the 1st argument');
-        switch (i) {
-          case this.DISTORTION_NONE:
-            return this.distortion_none;
-          case this.DISTORTION_MODIFIED_BROWN_CONRADY:
-            return this.distortion_modified_brown_conrady;
-          case this.DISTORTION_INVERSE_BROWN_CONRADY:
-            return this.distortion_inverse_brown_conrady;
-          case this.DISTORTION_FTHETA:
-            return this.distortion_ftheta;
-          case this.DISTORTION_BROWN_CONRADY:
-            return this.distortion_brown_conrady;
-        }
-      }
-    },
+  /**
+   * Get the string representation out of the integer distortion type
+   * @param {Integer} distortionVal the distortion type
+   * @return {String}
+   */
+  distortionToString: function(distortionVal) {
+    const funcName = 'distortion.distortionToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.distortion, 0, funcName);
+    switch (i) {
+      case this.DISTORTION_NONE:
+        return this.distortion_none;
+      case this.DISTORTION_MODIFIED_BROWN_CONRADY:
+        return this.distortion_modified_brown_conrady;
+      case this.DISTORTION_INVERSE_BROWN_CONRADY:
+        return this.distortion_inverse_brown_conrady;
+      case this.DISTORTION_FTHETA:
+        return this.distortion_ftheta;
+      case this.DISTORTION_BROWN_CONRADY:
+        return this.distortion_brown_conrady;
+    }
+  },
 };
 
 /**
@@ -3870,67 +5705,96 @@ const distortion = {
  * @enum {String}
  */
 const log_severity = {
-    /**
-     * String literal of <code>'debug'</code>. <br>Detailed information about ordinary operations.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_debug: 'debug',
-    /**
-     * String literal of <code>'info'</code>. <br>Terse information about ordinary operations.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_info: 'info',
-    /**
-     * String literal of <code>'warn'</code>. <br>Indication of possible failure.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_warn: 'warn',
-    /**
-     * String literal of <code>'error'</code>. <br>Indication of definite failure.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_error: 'error',
-    /**
-     * String literal of <code>'fatal'</code>. <br>Indication of unrecoverable failure.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_fatal: 'fatal',
-    /**
-     * String literal of <code>'none'</code>. <br>No logging will occur.
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    log_severity_none: 'none',
+  /**
+   * String literal of <code>'debug'</code>. <br>Detailed information about ordinary operations.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_debug: 'debug',
+  /**
+   * String literal of <code>'info'</code>. <br>Terse information about ordinary operations.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_info: 'info',
+  /**
+   * String literal of <code>'warn'</code>. <br>Indication of possible failure.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_warn: 'warn',
+  /**
+   * String literal of <code>'error'</code>. <br>Indication of definite failure.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_error: 'error',
+  /**
+   * String literal of <code>'fatal'</code>. <br>Indication of unrecoverable failure.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_fatal: 'fatal',
+  /**
+   * String literal of <code>'none'</code>. <br>No logging will occur.
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  log_severity_none: 'none',
 
-    /**
-     * Detailed information about ordinary operations. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_DEBUG: RS2.RS2_LOG_SEVERITY_DEBUG,
-    /**
-     * Terse information about ordinary operations. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_INFO: RS2.RS2_LOG_SEVERITY_INFO,
-    /**
-     * Indication of possible failure. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_WARN: RS2.RS2_LOG_SEVERITY_WARN,
-    /**
-     * Indication of definite failure. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_ERROR: RS2.RS2_LOG_SEVERITY_ERROR,
-    /**
-     * Indication of unrecoverable failure. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_FATAL: RS2.RS2_LOG_SEVERITY_FATAL,
-    /**
-     * No logging will occur. <br>Equivalent to its lowercase counterpart.
-     * @type {Integer}
-     */
-    LOG_SEVERITY_NONE: RS2.RS2_LOG_SEVERITY_NONE,
+  /**
+   * Detailed information about ordinary operations. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_DEBUG: RS2.RS2_LOG_SEVERITY_DEBUG,
+  /**
+   * Terse information about ordinary operations. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_INFO: RS2.RS2_LOG_SEVERITY_INFO,
+  /**
+   * Indication of possible failure. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_WARN: RS2.RS2_LOG_SEVERITY_WARN,
+  /**
+   * Indication of definite failure. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_ERROR: RS2.RS2_LOG_SEVERITY_ERROR,
+  /**
+   * Indication of unrecoverable failure. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_FATAL: RS2.RS2_LOG_SEVERITY_FATAL,
+  /**
+   * No logging will occur. <br>Equivalent to its lowercase counterpart.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_NONE: RS2.RS2_LOG_SEVERITY_NONE,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  LOG_SEVERITY_COUNT: RS2.RS2_LOG_SEVERITY_COUNT,
+  /**
+   * Get the string representation out of the integer log_severity type
+   * @param {Integer} severity the log_severity value
+   * @return {String}
+   */
+  logSeverityToString: function(severity) {
+    const funcName = 'log_severity.logSeverityToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.log_severity, 0, funcName);
+    switch (i) {
+      case this.LOG_SEVERITY_DEBUG:
+        return this.log_severity_debug;
+      case this.LOG_SEVERITY_INFO:
+        return this.log_severity_info;
+      case this.LOG_SEVERITY_WARN:
+        return this.log_severity_warn;
+      case this.LOG_SEVERITY_ERROR:
+        return this.log_severity_error;
+      case this.LOG_SEVERITY_FATAL:
+        return this.log_severity_fatal;
+      case this.LOG_SEVERITY_NONE:
+        return this.log_severity_none;
+    }
+  },
 };
 
 /**
@@ -3939,47 +5803,98 @@ const log_severity = {
  * @enum {String}
  */
 const notification_category = {
-    /**
-     * String literal of <code>'frames-timeout'</code>. <br>Frames didn't arrived within 5 seconds
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    notification_category_frames_timeout: 'frames-timeout',
-    /**
-     * String literal of <code>'frame-corrupted'</code>. <br>Received partial/incomplete frame
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    notification_category_frame_corrupted: 'frame-corrupted',
-    /**
-     * String literal of <code>'hardware-error'</code>. <br>Error reported from the device
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    notification_category_hardware_error: 'hardware-error',
-    /**
-     * String literal of <code>'unknown-error'</code>. <br>Received unknown error from the device
-     * <br>Equivalent to its uppercase counterpart.
-     */
-    notification_category_unknown_error: 'unknown-error',
-
-    /**
-     * Frames didn't arrived within 5 seconds <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    NOTIFICATION_CATEGORY_FRAMES_TIMEOUT: RS2.RS2_NOTIFICATION_CATEGORY_FRAMES_TIMEOUT,
-    /**
-     * Received partial/incomplete frame <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    NOTIFICATION_CATEGORY_FRAME_CORRUPTED: RS2.RS2_NOTIFICATION_CATEGORY_FRAME_CORRUPTED,
-    /**
-     * Error reported from the device <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    NOTIFICATION_CATEGORY_HARDWARE_ERROR: RS2.RS2_NOTIFICATION_CATEGORY_HARDWARE_ERROR,
-    /**
-     * Received unknown error from the device <br>Equivalent to its lowercase counterpart
-     * @type {Integer}
-     */
-    NOTIFICATION_CATEGORY_UNKNOWN_ERROR: RS2.RS2_NOTIFICATION_CATEGORY_UNKNOWN_ERROR,
+  /**
+   * String literal of <code>'frames-timeout'</code>. <br>Frames didn't arrived within 5 seconds
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_frames_timeout: 'frames-timeout',
+  /**
+   * String literal of <code>'frame-corrupted'</code>. <br>Received partial/incomplete frame
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_frame_corrupted: 'frame-corrupted',
+  /**
+   * String literal of <code>'hardware-error'</code>. <br>Error reported from the device
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_hardware_error: 'hardware-error',
+  /**
+   * String literal of <code>'hardware-event'</code>. <br>General hardware notification reported
+   * from the sensor <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_hardware_event: 'hardware-event',
+  /**
+   * String literal of <code>'unknown-error'</code>. <br>Received unknown error from the device
+   * <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_unknown_error: 'unknown-error',
+  /**
+   * String literal of <code>'firmware-update-recommended'</code>. <br>Current firmware version
+   * installed is not the latest available. <br>Equivalent to its uppercase counterpart.
+   */
+  notification_category_firmware_update_recommended: 'firmware-update-recommended',
+  /**
+   * Frames didn't arrived within 5 seconds <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_FRAMES_TIMEOUT: RS2.RS2_NOTIFICATION_CATEGORY_FRAMES_TIMEOUT,
+  /**
+   * Received partial/incomplete frame <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_FRAME_CORRUPTED: RS2.RS2_NOTIFICATION_CATEGORY_FRAME_CORRUPTED,
+  /**
+   * Error reported from the device <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_HARDWARE_ERROR: RS2.RS2_NOTIFICATION_CATEGORY_HARDWARE_ERROR,
+  /**
+   * General hardware notification reported from the sensor <br>Equivalent to its lowercase
+   * counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_HARDWARE_EVENT: RS2.RS2_NOTIFICATION_CATEGORY_HARDWARE_EVENT,
+  /**
+   * Received unknown error from the device <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_UNKNOWN_ERROR: RS2.RS2_NOTIFICATION_CATEGORY_UNKNOWN_ERROR,
+  /**
+   * Current firmware version installed is not the latest available <br>Equivalent to its lowercase
+   * counterpart
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_FIRMWARE_UPDATE_RECOMMENDED:
+      RS2.RS2_NOTIFICATION_CATEGORY_FIRMWARE_UPDATE_RECOMMENDED,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  NOTIFICATION_CATEGORY_COUNT: RS2.RS2_NOTIFICATION_CATEGORY_COUNT,
+  /**
+   * Get the string representation out of the integer notification_category type
+   * @param {Integer} notification the notification_category type
+   * @return {String}
+   */
+  notificationCategoryToString: function(notification) {
+    const funcName = 'notification_category.notificationCategoryToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.notification_category, 0, funcName);
+    switch (i) {
+      case this.NOTIFICATION_CATEGORY_FRAMES_TIMEOUT:
+        return this.notification_category_frames_timeout;
+      case this.NOTIFICATION_CATEGORY_FRAME_CORRUPTED:
+        return this.notification_category_frame_corrupted;
+      case this.NOTIFICATION_CATEGORY_HARDWARE_ERROR:
+        return this.notification_category_hardware_error;
+      case this.NOTIFICATION_CATEGORY_HARDWARE_EVENT:
+        return this.notification_category_hardware_event;
+      case this.NOTIFICATION_CATEGORY_UNKNOWN_ERROR:
+        return this.notification_category_unknown_error;
+      case this.NOTIFICATION_CATEGORY_FIRMWARE_UPDATE_RECOMMENDED:
+        return this.notification_category_firmware_update_recommended;
+    }
+  },
 };
 
 /**
@@ -3988,182 +5903,410 @@ const notification_category = {
  * @enum {String}
  */
 const timestamp_domain = {
-    /**
-     * String literal of <code>'hardware-clock'</code>. <br>Frame timestamp was measured in
-     * relation to the camera clock <br>Equivalent to its uppercase counterpart.
-     */
-    timestamp_domain_hardware_clock: 'hardware-clock',
-    /**
-     * String literal of <code>'system-time'</code>. <br>Frame timestamp was measured in relation
-     * to the OS system clock <br>Equivalent to its uppercase counterpart.
-     */
-    timestamp_domain_system_time: 'system-time',
+  /**
+   * String literal of <code>'hardware-clock'</code>. <br>Frame timestamp was measured in
+   * relation to the camera clock <br>Equivalent to its uppercase counterpart.
+   */
+  timestamp_domain_hardware_clock: 'hardware-clock',
+  /**
+   * String literal of <code>'system-time'</code>. <br>Frame timestamp was measured in relation
+   * to the OS system clock <br>Equivalent to its uppercase counterpart.
+   */
+  timestamp_domain_system_time: 'system-time',
 
-    /**
-     * Frame timestamp was measured in relation to the camera clock <br>Equivalent to its lowercase
-     * counterpart.
-     * @type {Integer}
-     */
-    TIMESTAMP_DOMAIN_HARDWARE_CLOCK: RS2.RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK,
-    /**
-     * Frame timestamp was measured in relation to the OS system clock <br>Equivalent to its
-     * lowercase counterpart.
-     * @type {Integer}
-     */
-    TIMESTAMP_DOMAIN_SYSTEM_TIME: RS2.RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME,
-    /**
-     * Number of enumeration values. Not a valid input: intended to be used in for-loops.
-     * @type {Integer}
-     */
-    TIMESTAMP_DOMAIN_COUNT: RS2.RS2_TIMESTAMP_DOMAIN_COUNT,
-    /**
-     * Get the string representation out of the integer timestamp_domain type
-     * @param {Integer} domainVal the timestamp_domain type
-     * @return {String}
-     */
-    timestampDomainToString: function(domainVal) {
-      if (arguments.length !== 1) {
-        throw new TypeError('timestamp_domain.timestampDomainToString() expects 1 argument');
-      }
-      let i = checkStringNumber(arguments[0],
-          this.TIMESTAMP_DOMAIN_HARDWARE_CLOCK, this.TIMESTAMP_DOMAIN_COUNT,
-          timestampDomain2Int,
-          'timestamp_domain.timestampDomainToString() expects a number or string as the 1st argument', // eslint-disable-line
-          'timestamp_domain.timestampDomainToString() expects a valid value as the 1st argument');
-      switch (i) {
-        case this.TIMESTAMP_DOMAIN_HARDWARE_CLOCK:
-          return this.timestamp_domain_hardware_clock;
-        case this.TIMESTAMP_DOMAIN_SYSTEM_TIME:
-          return this.timestamp_domain_system_time;
-        default:
-          throw new TypeError('timestamp_domain.timestampDomainToString() expects a valid value as the 1st argument'); // eslint-disable-line
-      }
-    },
+  /**
+   * Frame timestamp was measured in relation to the camera clock <br>Equivalent to its lowercase
+   * counterpart.
+   * @type {Integer}
+   */
+  TIMESTAMP_DOMAIN_HARDWARE_CLOCK: RS2.RS2_TIMESTAMP_DOMAIN_HARDWARE_CLOCK,
+  /**
+   * Frame timestamp was measured in relation to the OS system clock <br>Equivalent to its
+   * lowercase counterpart.
+   * @type {Integer}
+   */
+  TIMESTAMP_DOMAIN_SYSTEM_TIME: RS2.RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  TIMESTAMP_DOMAIN_COUNT: RS2.RS2_TIMESTAMP_DOMAIN_COUNT,
+  /**
+   * Get the string representation out of the integer timestamp_domain type
+   * @param {Integer} domainVal the timestamp_domain type
+   * @return {String}
+   */
+  timestampDomainToString: function(domainVal) {
+    const funcName = 'timestamp_domain.timestampDomainToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.timestamp_domain, 0, funcName);
+    switch (i) {
+      case this.TIMESTAMP_DOMAIN_HARDWARE_CLOCK:
+        return this.timestamp_domain_hardware_clock;
+      case this.TIMESTAMP_DOMAIN_SYSTEM_TIME:
+        return this.timestamp_domain_system_time;
+      default:
+        throw new TypeError('timestamp_domain.timestampDomainToString() expects a valid value as the 1st argument'); // eslint-disable-line
+    }
+  },
 };
 
 /**
- * Enum for visual preset
+ * Enum for visual preset of SR300 devices: provides optimized settings (presets) for specific
+ * types of usage.
  * @readonly
  * @enum {String}
  */
-const visual_preset = {
+const sr300_visual_preset = {
   /**
    * String literal of <code>'short-range'</code>. <br>Preset for short range.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_short_range: 'short-range',
+  sr300_visual_preset_short_range: 'short-range',
   /**
    * String literal of <code>'long-range'</code>. <br>Preset for long range.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_long_range: 'long-range',
+  sr300_visual_preset_long_range: 'long-range',
   /**
    * String literal of <code>'background-segmentation'</code>. <br>Preset for background
    * segmentation.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_background_segmentation: 'background-segmentation',
+  sr300_visual_preset_background_segmentation: 'background-segmentation',
   /**
    * String literal of <code>'gesture-recognition'</code>. <br>Preset for gesture recognition.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_gesture_recognition: 'gesture-recognition',
+  sr300_visual_preset_gesture_recognition: 'gesture-recognition',
   /**
    * String literal of <code>'object-scanning'</code>. <br>Preset for object scanning.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_object_scanning: 'object-scanning',
+  sr300_visual_preset_object_scanning: 'object-scanning',
   /**
    * String literal of <code>'face-analytics'</code>. <br>Preset for face analytics.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_face_analytics: 'face-analytics',
+  sr300_visual_preset_face_analytics: 'face-analytics',
   /**
    * String literal of <code>'face-login'</code>. <br>Preset for face login.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_face_login: 'face-login',
+  sr300_visual_preset_face_login: 'face-login',
   /**
    * String literal of <code>'gr-cursor'</code>. <br>Preset for GR cursor.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_gr_cursor: 'gr-cursor',
+  sr300_visual_preset_gr_cursor: 'gr-cursor',
   /**
    * String literal of <code>'default'</code>. <br>Preset for default.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_default: 'default',
+  sr300_visual_preset_default: 'default',
   /**
    * String literal of <code>'mid-range'</code>. <br>Preset for mid-range.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_mid_range: 'mid-range',
+  sr300_visual_preset_mid_range: 'mid-range',
   /**
    * String literal of <code>'ir-only'</code>. <br>Preset for IR only.
    * <br>Equivalent to its uppercase counterpart
    */
-  visual_preset_ir_only: 'ir-only',
+  sr300_visual_preset_ir_only: 'ir-only',
 
   /**
    * Preset for short range
+   * <br> Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_SHORT_RANGE: RS2.RS2_VISUAL_PRESET_SHORT_RANGE,
+  SR300_VISUAL_PRESET_SHORT_RANGE: RS2.RS2_SR300_VISUAL_PRESET_SHORT_RANGE,
   /**
    * Preset for long range
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_LONG_RANGE: RS2.RS2_VISUAL_PRESET_LONG_RANGE,
+  SR300_VISUAL_PRESET_LONG_RANGE: RS2.RS2_SR300_VISUAL_PRESET_LONG_RANGE,
   /**
    * Preset for background segmentation
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_BACKGROUND_SEGMENTATION: RS2.RS2_VISUAL_PRESET_BACKGROUND_SEGMENTATION,
+  SR300_VISUAL_PRESET_BACKGROUND_SEGMENTATION: RS2.RS2_SR300_VISUAL_PRESET_BACKGROUND_SEGMENTATION,
   /**
    * Preset for gesture recognition
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_GESTURE_RECOGNITION: RS2.RS2_VISUAL_PRESET_GESTURE_RECOGNITION,
+  SR300_VISUAL_PRESET_GESTURE_RECOGNITION: RS2.RS2_SR300_VISUAL_PRESET_GESTURE_RECOGNITION,
   /**
    * Preset for object scanning
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_OBJECT_SCANNING: RS2.RS2_VISUAL_PRESET_OBJECT_SCANNING,
+  SR300_VISUAL_PRESET_OBJECT_SCANNING: RS2.RS2_SR300_VISUAL_PRESET_OBJECT_SCANNING,
   /**
    * Preset for face analytics
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_FACE_ANALYTICS: RS2.RS2_VISUAL_PRESET_FACE_ANALYTICS,
+  SR300_VISUAL_PRESET_FACE_ANALYTICS: RS2.RS2_SR300_VISUAL_PRESET_FACE_ANALYTICS,
   /**
    * Preset for face login
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_FACE_LOGIN: RS2.RS2_VISUAL_PRESET_FACE_LOGIN,
+  SR300_VISUAL_PRESET_FACE_LOGIN: RS2.RS2_SR300_VISUAL_PRESET_FACE_LOGIN,
   /**
    * Preset for GR cursor
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_GR_CURSOR: RS2.RS2_VISUAL_PRESET_GR_CURSOR,
+  SR300_VISUAL_PRESET_GR_CURSOR: RS2.RS2_SR300_VISUAL_PRESET_GR_CURSOR,
   /**
    * Preset for default
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_DEFAULT: RS2.RS2_VISUAL_PRESET_DEFAULT,
+  SR300_VISUAL_PRESET_DEFAULT: RS2.RS2_SR300_VISUAL_PRESET_DEFAULT,
   /**
    * Preset for mid-range
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_MID_RANGE: RS2.RS2_VISUAL_PRESET_MID_RANGE,
+  SR300_VISUAL_PRESET_MID_RANGE: RS2.RS2_SR300_VISUAL_PRESET_MID_RANGE,
   /**
    * Preset for IR only
+   * <br>Equivalent to its lowercase counterpart.
    * @type {Integer}
    */
-  VISUAL_PRESET_IR_ONLY: RS2.RS2_VISUAL_PRESET_IR_ONLY,
+  SR300_VISUAL_PRESET_IR_ONLY: RS2.RS2_SR300_VISUAL_PRESET_IR_ONLY,
   /**
    * Number of enumeration values. Not a valid input: intended to be used in for-loops.
    * @type {Integer}
    */
-  VISUAL_PRESET_COUNT: RS2.RS2_VISUAL_PRESET_COUNT,
+  SR300_VISUAL_PRESET_COUNT: RS2.RS2_SR300_VISUAL_PRESET_COUNT,
+  /**
+   * Get the string representation out of the integer sr300_visual_preset type
+   * @param {Integer} preset the sr300_visual_preset type
+   * @return {String}
+   */
+  sr300VisualPresetToString: function(preset) {
+    const funcName = 'sr300_visual_preset.sr300VisualPresetToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.sr300_visual_preset, 0, funcName);
+    switch (i) {
+      case this.SR300_VISUAL_PRESET_SHORT_RANGE:
+        return this.sr300_visual_preset_short_range;
+      case this.SR300_VISUAL_PRESET_LONG_RANGE:
+        return this.sr300_visual_preset_long_range;
+      case this.SR300_VISUAL_PRESET_BACKGROUND_SEGMENTATION:
+        return this.sr300_visual_preset_background_segmentation;
+      case this.SR300_VISUAL_PRESET_GESTURE_RECOGNITION:
+        return this.sr300_visual_preset_gesture_recognition;
+      case this.SR300_VISUAL_PRESET_OBJECT_SCANNING:
+        return this.sr300_visual_preset_object_scanning;
+      case this.SR300_VISUAL_PRESET_FACE_ANALYTICS:
+        return this.sr300_visual_preset_face_analytics;
+      case this.SR300_VISUAL_PRESET_FACE_LOGIN:
+        return this.sr300_visual_preset_face_login;
+      case this.SR300_VISUAL_PRESET_GR_CURSOR:
+        return this.sr300_visual_preset_gr_cursor;
+      case this.SR300_VISUAL_PRESET_DEFAULT:
+        return this.sr300_visual_preset_default;
+      case this.SR300_VISUAL_PRESET_MID_RANGE:
+        return this.sr300_visual_preset_mid_range;
+      case this.SR300_VISUAL_PRESET_IR_ONLY:
+        return this.sr300_visual_preset_ir_only;
+    }
+  },
+};
+
+/**
+ * Enum for visual preset of RS400 devices: provides optimized settings (presets) for specific
+ * types of usage.
+ * @readonly
+ * @enum {String}
+ */
+const rs400_visual_preset = {
+  /**
+   * String literal of <code>'custom'</code>. <br>Preset for custom.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_custom: 'custom',
+  /**
+   * String literal of <code>'default'</code>. <br>Preset for default.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_default: 'default',
+  /**
+   * String literal of <code>'hand'</code>. <br>Preset for hand.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_hand: 'hand',
+  /**
+   * String literal of <code>'high-accuracy'</code>. <br>Preset for high-accuracy.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_high_accuracy: 'high-accuracy',
+  /**
+   * String literal of <code>'high-density'</code>. <br>Preset for high-density.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_high_density: 'high-density',
+  /**
+   * String literal of <code>'medium-density'</code>. <br>Preset for medium-density.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_medium_density: 'medium-density',
+  /**
+   * String literal of <code>'remove-ir-pattern'</code>. <br>Preset for remove-ir-pattern.
+   * <br>Equivalent to its uppercase counterpart
+   */
+  rs400_visual_preset_remove_ir_pattern: 'remove-ir-pattern',
+  /**
+   * Preset for custom
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_CUSTOM: RS2.RS2_RS400_VISUAL_PRESET_CUSTOM,
+  /**
+   * Preset for default
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_DEFAULT: RS2.RS2_RS400_VISUAL_PRESET_DEFAULT,
+  /**
+   * Preset for hand
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_HAND: RS2.RS2_RS400_VISUAL_PRESET_HAND,
+  /**
+   * Preset for high_accuracy
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_HIGH_ACCURACY: RS2.RS2_RS400_VISUAL_PRESET_HIGH_ACCURACY,
+  /**
+   * Preset for high-density
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_HIGH_DENSITY: RS2.RS2_RS400_VISUAL_PRESET_HIGH_DENSITY,
+  /**
+   * Preset for medium-density
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_MEDIUM_DENSITY: RS2.RS2_RS400_VISUAL_PRESET_MEDIUM_DENSITY,
+  /**
+   * Preset for remove-ir-pattern
+   * <br>Equivalent to its lowercase counterpart
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_REMOVE_IR_PATTERN: RS2.RS2_RS400_VISUAL_PRESET_REMOVE_IR_PATTERN,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  RS400_VISUAL_PRESET_COUNT: RS2.RS2_RS400_VISUAL_PRESET_COUNT,
+  /**
+   * Get the string representation out of the integer rs400_visual_preset type
+   * @param {Integer} preset the rs400_visual_preset type
+   * @return {String}
+   */
+  rs400VisualPresetToString: function(preset) {
+    const funcName = 'rs400_visual_preset.rs400VisualPresetToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.rs400_visual_preset, 0, funcName);
+    switch (i) {
+      case this.RS400_VISUAL_PRESET_CUSTOM:
+        return this.rs400_visual_preset_custom;
+      case this.RS400_VISUAL_PRESET_DEFAULT:
+        return this.rs400_visual_preset_default;
+      case this.RS400_VISUAL_PRESET_HAND:
+        return this.rs400_visual_preset_hand;
+      case this.RS400_VISUAL_PRESET_HIGH_ACCURACY:
+        return this.rs400_visual_preset_high_accuracy;
+      case this.RS400_VISUAL_PRESET_HIGH_DENSITY:
+        return this.rs400_visual_preset_high_density;
+      case this.RS400_VISUAL_PRESET_MEDIUM_DENSITY:
+        return this.rs400_visual_preset_medium_density;
+      case this.RS400_VISUAL_PRESET_REMOVE_IR_PATTERN:
+        return this.rs400_visual_preset_remove_ir_pattern;
+    }
+  },
+};
+
+const playback_status = {
+  /**
+   * String literal of <code>'unknown'</code>. <br>Unknown state
+   * <br>Equivalent to its uppercase counterpart
+   */
+  playback_status_unknown: 'unknown',
+  /**
+   * String literal of <code>'playing'</code>. <br>One or more sensors were
+   * started, playback is reading and raising data
+   * <br>Equivalent to its uppercase counterpart
+   */
+  playback_status_playing: 'playing',
+  /**
+   * String literal of <code>'paused'</code>. <br>One or more sensors were
+   * started, but playback paused reading and paused raising data
+   * <br>Equivalent to its uppercase counterpart
+   */
+  playback_status_paused: 'paused',
+  /**
+   * String literal of <code>'stopped'</code>. <br>All sensors were stopped, or playback has
+   * ended (all data was read). This is the initial playback status
+   * <br>Equivalent to its uppercase counterpart
+   */
+  playback_status_stopped: 'stopped',
+  /**
+   * Unknown state
+   */
+  PLAYBACK_STATUS_UNKNOWN: RS2.RS2_PLAYBACK_STATUS_UNKNOWN,
+  /**
+   * One or more sensors were started, playback is reading and raising data
+   */
+  PLAYBACK_STATUS_PLAYING: RS2.RS2_PLAYBACK_STATUS_PLAYING,
+  /**
+   * One or more sensors were started, but playback paused reading and paused raising dat
+   */
+  PLAYBACK_STATUS_PAUSED: RS2.RS2_PLAYBACK_STATUS_PAUSED,
+  /**
+   * All sensors were stopped, or playback has ended (all data was read). This is the initial
+   * playback statu
+   */
+  PLAYBACK_STATUS_STOPPED: RS2.RS2_PLAYBACK_STATUS_STOPPED,
+  /**
+   * Number of enumeration values. Not a valid input: intended to be used in for-loops.
+   * @type {Integer}
+   */
+  PLAYBACK_STATUS_COUNT: RS2.RS2_PLAYBACK_STATUS_COUNT,
+  /**
+   * Get the string representation out of the integer playback_status type
+   * @param {Integer} status the playback_status type
+   * @return {String}
+   */
+  playbackStatusToString: function(status) {
+    const funcName = 'playback_status.playbackStatusToString()';
+    checkArgumentLength(1, 1, arguments.length, funcName);
+    const i = checkArgumentType(arguments, constants.playback_status, 0, funcName);
+    switch (i) {
+      case this.PLAYBACK_STATUS_UNKNOWN:
+        return this.playback_status_unknown;
+      case this.PLAYBACK_STATUS_PLAYING:
+        return this.playback_status_playing;
+      case this.PLAYBACK_STATUS_PAUSED:
+        return this.playback_status_paused;
+      case this.PLAYBACK_STATUS_STOPPED:
+        return this.playback_status_stopped;
+      default:
+        throw new TypeError('playback_status.playbackStatusToString() expects a valid value as the 1st argument'); // eslint-disable-line
+    }
+  },
 };
 
 // e.g. str2Int('enable_motion_correction', 'option')
@@ -4173,41 +6316,46 @@ function str2Int(str, category) {
 }
 
 function stream2Int(str) {
- return str2Int(str, 'stream');
+  return str2Int(str, 'stream');
 }
 function format2Int(str) {
- return str2Int(str, 'format');
+  return str2Int(str, 'format');
 }
 function option2Int(str) {
- return str2Int(str, 'option');
+  return str2Int(str, 'option');
 }
 function cameraInfo2Int(str) {
- return str2Int(str, 'camera_info');
+  return str2Int(str, 'camera_info');
 }
 function recordingMode2Int(str) {
- return str2Int(str, 'recording_mode');
+  return str2Int(str, 'recording_mode');
 }
 function timestampDomain2Int(str) {
- return str2Int(str, 'timestamp_domain');
+  return str2Int(str, 'timestamp_domain');
 }
-function NotificationCategory2Int(str) {
- return str2Int(str, 'notification_category');
+function notificationCategory2Int(str) {
+  return str2Int(str, 'notification_category');
 }
 function logSeverity2Int(str) {
- return str2Int(str, 'log_severity');
+  return str2Int(str, 'log_severity');
 }
 function distortion2Int(str) {
- return str2Int(str, 'distortion');
+  return str2Int(str, 'distortion');
 }
 function frameMetadata2Int(str) {
- return str2Int(str, 'frame_metadata');
+  return str2Int(str, 'frame_metadata');
 }
-function visualPreset2Int(str) {
- return str2Int(str, 'visual_preset');
+function sr300VisualPreset2Int(str) {
+  return str2Int(str, 'sr300_visual_preset');
 }
-
+function rs400VisualPreset2Int(str) {
+  return str2Int(str, 'rs400_visual_preset');
+}
+function playbackStatus2Int(str) {
+  return str2Int(str, 'playback_status');
+}
 function isArrayBuffer(value) {
-    return value && value instanceof ArrayBuffer && value.byteLength !== undefined;
+  return value && (value instanceof ArrayBuffer) && (value.byteLength !== undefined);
 }
 
 const constants = {
@@ -4221,16 +6369,42 @@ const constants = {
   log_severity: log_severity,
   distortion: distortion,
   frame_metadata: frame_metadata,
-  visual_preset: visual_preset,
+  sr300_visual_preset: sr300_visual_preset,
+  rs400_visual_preset: rs400_visual_preset,
+  playback_status: playback_status,
 };
 
+/**
+ * Cleanup resources
+ */
 function cleanup() {
   internal.cleanup();
   RS2.globalCleanup();
 }
 
+/**
+ * Error Information returned from native SDK
+ * @typedef {Object} ErrorInfoObject
+ * @property {Boolean} recoverable - True if the error is a recoverable error
+ * @property {String} description - Detailed description of the error
+ * @property {String} nativeFunction - Native function that triggered the error
+ * @see [getError()]{@link getError}
+ */
+
+/**
+ * Get the error info
+ * User could call this method to get the detailed error info if the previous
+ * API failed.
+ * @return {ErrorInfoObject|undefined} If there is no error, undefined is returned
+ */
+function getError() {
+  return RS2.getError();
+}
+
 module.exports = {
   cleanup: cleanup,
+  getError: getError,
+  UnrecoverableError: UnrecoverableError,
 
   Context: Context,
   Pipeline: Pipeline,
@@ -4238,6 +6412,7 @@ module.exports = {
   Config: Config,
   Colorizer: Colorizer,
   Device: Device,
+  Tm2: Tm2,
   DeviceList: DeviceList,
   DeviceHub: DeviceHub,
   Sensor: Sensor,
@@ -4245,16 +6420,27 @@ module.exports = {
   ROISensor: ROISensor,
   StreamProfile: StreamProfile,
   VideoStreamProfile: VideoStreamProfile,
+  MotionStreamProfile: MotionStreamProfile,
   Frame: Frame,
   FrameSet: FrameSet,
   VideoFrame: VideoFrame,
   DepthFrame: DepthFrame,
+  DisparityFrame: DisparityFrame,
+  MotionFrame: MotionFrame,
+  PoseFrame: PoseFrame,
   Align: Align,
   PointCloud: PointCloud,
   Points: Points,
-  // PlaybackContext: PlaybackContext,
-  // RecordingContext: RecordingContext,
   Syncer: Syncer,
+  RecorderDevice: RecorderDevice,
+  PlaybackDevice: PlaybackDevice,
+  DecimationFilter: DecimationFilter,
+  TemporalFilter: TemporalFilter,
+  SpatialFilter: SpatialFilter,
+  HoleFillingFilter: HoleFillingFilter,
+  DisparityToDepthTransform: DisparityToDepthTransform,
+  DepthToDisparityTransform: DepthToDisparityTransform,
+
 
   stream: stream,
   format: format,
@@ -4266,9 +6452,14 @@ module.exports = {
   log_severity: log_severity,
   distortion: distortion,
   frame_metadata: frame_metadata,
-  visual_preset: visual_preset,
+  sr300_visual_preset: sr300_visual_preset,
+  rs400_visual_preset: rs400_visual_preset,
+  playback_status: playback_status,
 
   util: util,
+  internal: internal,
 
   stringConstantToIntegerValue: str2Int,
 };
+
+internal.registerErrorCallback();

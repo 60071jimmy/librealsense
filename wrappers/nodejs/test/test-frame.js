@@ -6,12 +6,18 @@
 
 /* global describe, it, before, after */
 const assert = require('assert');
-const rs2 = require('../index.js');
+let rs2;
+try {
+  rs2 = require('node-librealsense');
+} catch (e) {
+  rs2 = require('../index.js');
+}
 
 let frame;
+let pipeline;
 describe('Frame test', function() {
   before(function() {
-    const pipeline = new rs2.Pipeline();
+    pipeline = new rs2.Pipeline();
     pipeline.start();
     while (!frame) {
       const frameset = pipeline.waitForFrames();
@@ -20,11 +26,12 @@ describe('Frame test', function() {
   });
 
   after(function() {
+    pipeline.destroy();
     rs2.cleanup();
   });
 
   it('Testing constructor', () => {
-    assert.throws(() => {
+    assert.doesNotThrow(() => {
       new rs2.Frame();
     });
   });
@@ -55,8 +62,7 @@ describe('Frame test', function() {
     assert.equal(typeof frame.timestamp, 'number');
   });
 
-  // DSO-7440
-  it.skip('Testing property streamType', () => {
+  it('Testing property streamType', () => {
     assert.equal(typeof frame.streamType, 'number');
   });
 
@@ -73,7 +79,7 @@ describe('Frame test', function() {
   });
 
   it('Testing property timestampDomain', () => {
-    assert.equal(typeof frame.timestampDomain, 'string');
+    assert.equal(typeof frame.timestampDomain, 'number');
   });
 
   it('Testing method frameMetadata - 0 argument', () => {
@@ -94,12 +100,18 @@ describe('Frame test', function() {
       i.toUpperCase() !== 'FRAME_METADATA_COUNT' && // skip counter
       i !== 'frameMetadataToString' // skip method
       ) {
-        assert.doesNotThrow(() => { // jshint ignore:line
-          frame.frameMetadata(rs2.frame_metadata[i]);
-        });
-        assert.equal(Object.prototype.toString.call(
-          frame.frameMetadata(rs2.frame_metadata[i])
-        ), '[object Uint8Array]');
+        if (frame.supportsFrameMetadata(rs2.frame_metadata[i])) {
+          assert.doesNotThrow(() => { // jshint ignore:line
+            frame.frameMetadata(rs2.frame_metadata[i]);
+          });
+          assert.equal(Object.prototype.toString.call(
+            frame.frameMetadata(rs2.frame_metadata[i])
+          ), '[object Uint8Array]');
+        } else {
+          assert.throws(() => { // jshint ignore:line
+            frame.frameMetadata(rs2.frame_metadata[i]);
+          });
+        }
       }
     }
   });
@@ -115,10 +127,9 @@ describe('Frame test', function() {
     );
   });
 
-  it.skip('Testing method getData - buffer argument', () => {
+  it('Testing method getData - buffer argument', () => {
     const len = frame.dataByteLength;
     let buf = new ArrayBuffer(len);
-    console.log(typeof buf);
     assert.doesNotThrow(() => {
       frame.getData(buf);
     });
@@ -167,8 +178,5 @@ describe('Frame test', function() {
     assert.doesNotThrow(() => {
       frame.destroy();
     });
-    setTimeout(() => {
-      assert.equal(frame, undefined);
-    }, 100);
   });
 });

@@ -14,113 +14,177 @@ const int QUEUE_MAX_SIZE = 10;
 template<class T>
 class single_consumer_queue
 {
-    std::deque<T> q;
-    std::mutex mutex;
-    std::condition_variable cv; // not empty signal
-    unsigned int cap;
-    bool accepting;
+    std::deque<T> _queue;
+    std::mutex _mutex;
+    std::condition_variable _deq_cv; // not empty signal
+    std::condition_variable _enq_cv; // not empty signal
+
+    unsigned int _cap;
+    bool _accepting;
 
     // flush mechanism is required to abort wait on cv
     // when need to stop
-    std::atomic<bool> need_to_flush;
-    std::atomic<bool> was_flushed;
-    std::condition_variable was_flushed_cv;
-    std::mutex was_flushed_mutex;
+    std::atomic<bool> _need_to_flush;
+    std::atomic<bool> _was_flushed;
 public:
     explicit single_consumer_queue<T>(unsigned int cap = QUEUE_MAX_SIZE)
-        : q(), mutex(), cv(), cap(cap), need_to_flush(false), was_flushed(false), accepting(true)
+        : _queue(), _mutex(), _deq_cv(), _enq_cv(), _cap(cap), _need_to_flush(false), _was_flushed(false), _accepting(true)
     {}
 
     void enqueue(T&& item)
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (accepting)
+        std::unique_lock<std::mutex> lock(_mutex);
+        if (_accepting)
         {
-            q.push_back(std::move(item));
-            if (q.size() > cap)
+            _queue.push_back(std::move(item));
+            if (_queue.size() > _cap)
             {
-                q.pop_front();
+                _queue.pop_front();
             }
         }
         lock.unlock();
-        cv.notify_one();
+        _deq_cv.notify_one();
     }
 
-    bool dequeue(T* item ,unsigned int timeout_ms = 5000)
+    void blocking_enqueue(T&& item)
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        accepting = true;
-        was_flushed = false;
-        const auto ready = [this]() { return (q.size() > 0) || need_to_flush; };
-        if (!ready() && !cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready))
-        {
-            return false;
-        }
+        auto pred = [this]()->bool { return _queue.size() < _cap || _need_to_flush; };
 
-        if (q.size() <= 0)
+        std::unique_lock<std::mutex> lock(_mutex);
+        if (_accepting)
         {
-            return false;
+            _enq_cv.wait(lock, pred);
+            _queue.push_back(std::move(item));
         }
-        *item = std::move(q.front());
-        q.pop_front();
-        return true;
+        lock.unlock();
+        _deq_cv.notify_one();
     }
 
-    bool peek(T** item)
-    {
-        std::unique_lock<std::mutex> lock(mutex);
 
-        if (q.size() <= 0)
+    bool dequeue(T* item ,unsigned int timeout_ms)
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _accepting = true;
+        _was_flushed = false;
+        const auto ready = [this]() { return (_queue.size() > 0) || _need_to_flush; };
+        if (!ready() && !_deq_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready))
         {
             return false;
         }
-        *item = &q.front();
+
+        if (_queue.size() <= 0)
+        {
+            return false;
+        }
+        *item = std::move(_queue.front());
+        _queue.pop_front();
+        _enq_cv.notify_one();
         return true;
     }
 
     bool try_dequeue(T* item)
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        accepting = true;
-        if (q.size() > 0)
+        std::unique_lock<std::mutex> lock(_mutex);
+        _accepting = true;
+        if (_queue.size() > 0)
         {
-            auto val = std::move(q.front());
-            q.pop_front();
+            auto val = std::move(_queue.front());
+            _queue.pop_front();
             *item = std::move(val);
+            _enq_cv.notify_one();
             return true;
         }
         return false;
     }
 
+    bool peek(T** item)
+    {
+        std::unique_lock<std::mutex> lock(_mutex);
+
+        if (_queue.size() <= 0)
+        {
+            return false;
+        }
+        *item = &_queue.front();
+        return true;
+    }
+
     void clear()
     {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(_mutex);
 
-        accepting = false;
-        need_to_flush = true;
+        _accepting = false;
+        _need_to_flush = true;
 
-        while (q.size() > 0)
+        _enq_cv.notify_all();
+        while (_queue.size() > 0)
         {
-            auto item = std::move(q.front());
-            q.pop_front();
+            auto item = std::move(_queue.front());
+            _queue.pop_front();
         }
-        cv.notify_all();
+        _deq_cv.notify_all();
     }
 
     void start()
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        need_to_flush = false;
-        accepting = true;
+        std::unique_lock<std::mutex> lock(_mutex);
+        _need_to_flush = false;
+        _accepting = true;
     }
 
     size_t size()
     {
-        std::unique_lock<std::mutex> lock(mutex);
-        return q.size();
+        std::unique_lock<std::mutex> lock(_mutex);
+        return _queue.size();
     }
 };
 
+template<class T>
+class single_consumer_frame_queue
+{
+    single_consumer_queue<T> _queue;
+
+public:
+    single_consumer_frame_queue<T>(unsigned int cap = QUEUE_MAX_SIZE) : _queue(cap) {}
+
+    void enqueue(T&& item)
+    {
+        if (item.is_blocking())
+            _queue.blocking_enqueue(std::move(item));
+        else
+            _queue.enqueue(std::move(item));
+    }
+
+    bool dequeue(T* item, unsigned int timeout_ms)
+    {
+        return _queue.dequeue(item, timeout_ms);
+    }
+
+    bool peek(T** item)
+    {
+        return _queue.peek(item);
+    }
+
+    bool try_dequeue(T* item)
+    {
+        return _queue.try_dequeue(item);
+    }
+
+    void clear()
+    {
+        _queue.clear();
+    }
+
+    void start()
+    {
+        _queue.start();
+    }
+
+    size_t size()
+    {
+        return _queue.size();
+    }
+};
 
 class dispatcher
 {
@@ -153,31 +217,63 @@ public:
     {
         _thread = std::thread([&]()
         {
+            int timeout_ms = 5000;
             while (_is_alive)
             {
                 std::function<void(cancellable_timer)> item;
 
-                if (_queue.dequeue(&item))
+                if (_queue.dequeue(&item, timeout_ms))
                 {
                     cancellable_timer time(this);
-                    item(time);
+
+                    try
+                    {
+                        item(time);
+                    }
+                    catch(...){}
                 }
 
+#ifndef ANDROID
                 std::unique_lock<std::mutex> lock(_was_flushed_mutex);
+#endif
                 _was_flushed = true;
                 _was_flushed_cv.notify_all();
+#ifndef ANDROID
                 lock.unlock();
+#endif
             }
         });
     }
 
     template<class T>
-    void invoke(T item)
+    void invoke(T item, bool is_blocking = false)
     {
         if (!_was_stopped)
         {
-            _queue.enqueue(std::move(item));
+            if(is_blocking)
+                _queue.blocking_enqueue(std::move(item));
+            else
+                _queue.enqueue(std::move(item));
         }
+    }
+
+    template<class T>
+    void invoke_and_wait(T item, std::function<bool()> exit_condition, bool is_blocking = false)
+    {
+        bool done = false;
+
+        //action
+        auto func = std::move(item);
+        invoke([&, func](dispatcher::cancellable_timer c)
+        {
+            func(c);
+            done = true;
+            _blocking_invoke_cv.notify_one();
+        }, is_blocking);
+
+        //wait
+        std::unique_lock<std::mutex> lk(_blocking_invoke_mutex);
+        while(_blocking_invoke_cv.wait_for(lk, std::chrono::milliseconds(10), [&](){ return !done && !exit_condition(); }));
     }
 
     void start()
@@ -239,6 +335,12 @@ public:
         *wait_sucess = cv.wait_for(locker, std::chrono::seconds(10), [&]() { return invoked || _was_stopped; });
         return *wait_sucess;
     }
+
+    bool empty()
+    {
+        return _queue.size() == 0;
+    }
+
 private:
     friend cancellable_timer;
     single_consumer_queue<std::function<void(cancellable_timer)>> _queue;
@@ -251,6 +353,9 @@ private:
     std::atomic<bool> _was_flushed;
     std::condition_variable _was_flushed_cv;
     std::mutex _was_flushed_mutex;
+
+    std::condition_variable _blocking_invoke_cv;
+    std::mutex _blocking_invoke_mutex;
 
     std::atomic<bool> _is_alive;
 };
@@ -298,4 +403,44 @@ private:
     T _operation;
     dispatcher _dispatcher;
     std::atomic<bool> _stopped;
+};
+
+class watchdog
+{
+public:
+    watchdog(std::function<void()> operation, uint64_t timeout_ms) :
+            _operation(std::move(operation)), _timeout_ms(timeout_ms)
+    {
+        _watcher = std::make_shared<active_object<>>([this](dispatcher::cancellable_timer cancellable_timer)
+        {
+            if(cancellable_timer.try_sleep(_timeout_ms))
+            {
+                if(!_kicked)
+                    _operation();
+                std::lock_guard<std::mutex> lk(_m);
+                _kicked = false;
+            }
+        });
+    }
+
+    ~watchdog()
+    {
+        if(_running)
+            stop();
+    }
+
+    void start() { std::lock_guard<std::mutex> lk(_m); _watcher->start(); _running = true; }
+    void stop() { { std::lock_guard<std::mutex> lk(_m); _running = false; } _watcher->stop(); }
+    bool running() { std::lock_guard<std::mutex> lk(_m); return _running; }
+    void set_timeout(uint64_t timeout_ms) { std::lock_guard<std::mutex> lk(_m); _timeout_ms = timeout_ms; }
+    void kick() { std::lock_guard<std::mutex> lk(_m); _kicked = true; }
+
+private:
+    std::mutex _m;
+    uint64_t _timeout_ms;
+    bool _kicked = false;
+    bool _running = false;
+    bool _blocker = true;
+    std::function<void()> _operation;
+    std::shared_ptr<active_object<>> _watcher;
 };

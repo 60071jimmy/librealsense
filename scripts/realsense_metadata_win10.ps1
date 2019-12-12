@@ -58,13 +58,22 @@ $MultiPinDevices =
     "USB\VID_8086&PID_0AD3&MI_00",# D410+RGB(ASRC)
     "USB\VID_8086&PID_0AD4&MI_00",# D430(AWG)
     "USB\VID_8086&PID_0AD5&MI_00",# D430+MM(AWGT)
+    "USB\VID_8086&PID_0AD6&MI_00",# D400/ USB2
     "USB\VID_8086&PID_0AF6&MI_00",# D420 (PWG)
     "USB\VID_8086&PID_0AFE&MI_00",# D420+MM(PWGT)
     "USB\VID_8086&PID_0AFF&MI_00",# D410+MM(ASRT)
     "USB\VID_8086&PID_0B00&MI_00",# D400+MM(PSRT)
     "USB\VID_8086&PID_0B01&MI_00",# D430+RGB+MM(AWGCT)
     "USB\VID_8086&PID_0B03&MI_00",# D460(DS5U)
-    "USB\VID_8086&PID_0B07&MI_00" # D430+RGB(AWGC)
+    "USB\VID_8086&PID_0B07&MI_00",# D430+RGB(AWGC)
+    "USB\VID_8086&PID_0B0C&MI_00",# D405
+    "USB\VID_8086&PID_0B0D&MI_00",# L500
+    "USB\VID_8086&PID_0B3A&MI_00",# D435i
+    "USB\VID_8086&PID_0B3D&MI_00",# L515
+    "USB\VID_8086&PID_0B49&MI_00",# F416
+    "USB\VID_8086&PID_0B4B&MI_00",# D430i
+    "USB\VID_8086&PID_0B4D&MI_00" # D465
+    "USB\VID_8086&PID_0B52&MI_00" # F416+RGB
 
 #Inhibit system warnings and erros, such as permissions or missing values
 $ErrorActionPreference = "silentlycontinue"
@@ -118,12 +127,14 @@ foreach ($subtree in $SearchTrees)
             # Non-present value will be ignored as for script execution policy
             Remove-ItemProperty -path $fullPath -name MetadataBufferSizeInKB0
             Remove-ItemProperty -path $fullPath -name MetadataBufferSizeInKB1
+			Remove-ItemProperty -path $fullPath -name MetadataBufferSizeInKB2
         }
         else
         {
-            $val = 0,0
+            $val = 0,0,0
             $val[0] = Get-ItemPropertyValue -Path $fullPath -Name MetadataBufferSizeInKB0
             $val[1] = Get-ItemPropertyValue -Path $fullPath -Name MetadataBufferSizeInKB1
+			$val[2] = Get-ItemPropertyValue -Path $fullPath -Name MetadataBufferSizeInKB2
 
             if ($val[0] -eq 0)
             {
@@ -141,6 +152,13 @@ foreach ($subtree in $SearchTrees)
                 # Multi-pin interface requires an additional key
                 "Device " +  $item.DeviceInstance.ToString() +": adding extra key for multipin interface"
                 Set-ItemProperty -path $fullPath -name MetadataBufferSizeInKB1 -value 5
+            }
+			#convert "USB\VID_8086&PID_0B07&MI_03\6&269496df&0&0003" into "USB\VID_8086&PID_0B07&MI_03"
+            if (($MultiPinDevices -contains $item.DeviceInstance.Substring(0,27)) -and ($val[2] -eq 0))
+            {
+                # Multi-pin interface requires an additional key
+                "Device " +  $item.DeviceInstance.ToString() +": adding extra key for multipin interface"
+                Set-ItemProperty -path $fullPath -name MetadataBufferSizeInKB2 -value 5
             }
         }
     }

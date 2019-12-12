@@ -41,9 +41,9 @@ namespace librealsense
         return std::make_shared<frame_queue_size>(&_max_publish_list_size, option_range{ 0, 32, 1, 16 });
     }
 
-    frame_source::frame_source()
+    frame_source::frame_source(uint32_t max_publish_list_size)
             : _callback(nullptr, [](rs2_frame_callback*) {}),
-              _max_publish_list_size(16),
+              _max_publish_list_size(max_publish_list_size),
               _ts(environment::get_instance().get_time_service())
     {}
 
@@ -54,12 +54,17 @@ namespace librealsense
         std::vector<rs2_extension> supported { RS2_EXTENSION_VIDEO_FRAME,
                                                RS2_EXTENSION_COMPOSITE_FRAME,
                                                RS2_EXTENSION_POINTS,
-                                               RS2_EXTENSION_DEPTH_FRAME };
+                                               RS2_EXTENSION_DEPTH_FRAME,
+                                               RS2_EXTENSION_DISPARITY_FRAME,
+                                               RS2_EXTENSION_MOTION_FRAME,
+                                               RS2_EXTENSION_POSE_FRAME };
 
         for (auto type : supported)
         {
             _archive[type] = make_archive(type, &_max_publish_list_size, _ts, metadata_parsers);
         }
+
+        _metadata_parsers = metadata_parsers;
     }
 
     callback_invocation_holder frame_source::begin_callback()
@@ -76,6 +81,7 @@ namespace librealsense
         {
             kvp.second.reset();
         }
+        _metadata_parsers.reset();
     }
 
     frame_interface* frame_source::alloc_frame(rs2_extension type, size_t size, frame_additional_data additional_data, bool requires_memory) const
@@ -85,7 +91,7 @@ namespace librealsense
         return it->second->alloc_and_track(size, additional_data, requires_memory);
     }
 
-    void frame_source::set_sensor(std::shared_ptr<sensor_interface> s)
+    void frame_source::set_sensor(const std::shared_ptr<sensor_interface>& s)
     {
         for (auto&& a : _archive)
         {
@@ -99,6 +105,11 @@ namespace librealsense
         _callback = callback;
     }
 
+    frame_callback_ptr frame_source::get_callback() const
+    {
+        std::lock_guard<std::mutex> lock(_callback_mutex);
+        return _callback;
+    }
     void frame_source::invoke_callback(frame_holder frame) const
     {
         if (frame)

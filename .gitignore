@@ -2,9 +2,15 @@ bin/
 lib/
 
 ubuntu-xenial/
+ubuntu-xenial-hwe/
+
+# Docs
+doc/doxygen/html/
+*.html.lnk
 
 # CMake
-build/
+build*/
+connectivity_check
 
 # XCode
 .DS_Store
@@ -71,7 +77,6 @@ librealsense-log.txt
 *.exe
 *.cache
 *.lib
-*.sln
 *.filters
 *.db
 *.opendb
@@ -79,9 +84,8 @@ librealsense-log.txt
 *.check_cache
 *.dll
 *.list
-*.txt
-!CMakeLists.txt
 *.json
 *.ini
 *.cxx
 
+.vscode/*

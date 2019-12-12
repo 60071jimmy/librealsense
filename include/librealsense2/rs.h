@@ -23,12 +23,16 @@ extern "C" {
 #include "h/rs_sensor.h"
 
 #define RS2_API_MAJOR_VERSION    2
-#define RS2_API_MINOR_VERSION    8
-#define RS2_API_PATCH_VERSION    1
+#define RS2_API_MINOR_VERSION    31
+#define RS2_API_PATCH_VERSION    0
 #define RS2_API_BUILD_VERSION    0
 
+#ifndef STRINGIFY
 #define STRINGIFY(arg) #arg
+#endif
+#ifndef VAR_ARG_STRING
 #define VAR_ARG_STRING(arg) STRINGIFY(arg)
+#endif
 
 /* Versioning rules            : For each release at least one of [MJR/MNR/PTCH] triple is promoted                                             */
 /*                             : Versions that differ by RS2_API_PATCH_VERSION only are interface-compatible, i.e. no user-code changes required */
@@ -71,11 +75,24 @@ void rs2_log_to_console(rs2_log_severity min_severity, rs2_error ** error);
 
 void rs2_log_to_file(rs2_log_severity min_severity, const char * file_path, rs2_error ** error);
 
+/**
+ * Add custom message into librealsense log
+ * \param[in] severity  The log level for the message to be written under
+ * \param[in] message   Message to be logged
+ * \param[out] error  if non-null, receives any error that occurs during this call, otherwise, errors are ignored
+ */
+void rs2_log(rs2_log_severity severity, const char * message, rs2_error ** error);
+
+/**
+* Given the 2D depth coordinate (x,y) provide the corresponding depth in metric units
+* \param[in] frame_ref  2D depth pixel coordinates (Left-Upper corner origin)
+* \param[in] x,y  2D depth pixel coordinates (Left-Upper corner origin)
+* \param[out] error  if non-null, receives any error that occurs during this call, otherwise, errors are ignored
+*/
 float rs2_depth_frame_get_distance(const rs2_frame* frame_ref, int x, int y, rs2_error** error);
 
 /**
 * return the time at specific time point
-* \param context     Object representing librealsense session
 * \param[out] error  if non-null, receives any error that occurs during this call, otherwise, errors are ignored
 * \return            the time at specific time point, in live and record mode it will return the system time and in playback mode it will return the recorded time
 */

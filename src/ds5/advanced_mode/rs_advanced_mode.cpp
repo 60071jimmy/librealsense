@@ -22,17 +22,20 @@ namespace librealsense
         #define CASE(X) STRCASE(RS400_VISUAL_PRESET, X)
         switch (value)
         {
+        CASE(CUSTOM)
         CASE(HAND)
-        CASE(SHORT_RANGE)
         CASE(HIGH_ACCURACY)
         CASE(HIGH_DENSITY)
         CASE(MEDIUM_DENSITY)
-        CASE(CUSTOM)
+        CASE(DEFAULT)
+        CASE(REMOVE_IR_PATTERN)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
         #undef CASE
     }
 }
+
+using namespace librealsense;
 
 const char* rs2_rs400_visual_preset_to_string(rs2_rs400_visual_preset preset){ return get_string(preset); }
 
@@ -268,6 +271,27 @@ void rs2_get_census(rs2_device* dev, STCensusRadius* group, int mode, rs2_error*
     advanced_mode->get_census_radius(group, mode);
 }
 HANDLE_EXCEPTIONS_AND_RETURN(, dev, group, mode)
+
+void rs2_set_amp_factor(rs2_device* dev, const  STAFactor* group, rs2_error** error) BEGIN_API_CALL
+{
+    VALIDATE_NOT_NULL(dev);
+    VALIDATE_NOT_NULL(group);
+    auto advanced_mode = VALIDATE_INTERFACE(dev->device, librealsense::ds5_advanced_mode_interface);
+    advanced_mode->set_amp_factor(*group);
+}
+HANDLE_EXCEPTIONS_AND_RETURN(, dev, group)
+
+void rs2_get_amp_factor(rs2_device* dev, STAFactor* group, int mode, rs2_error** error) BEGIN_API_CALL
+{
+    VALIDATE_NOT_NULL(dev);
+    VALIDATE_NOT_NULL(group);
+    auto advanced_mode = VALIDATE_INTERFACE(dev->device, librealsense::ds5_advanced_mode_interface);
+    advanced_mode->get_amp_factor(group, mode);
+}
+HANDLE_EXCEPTIONS_AND_RETURN(, dev, group, mode)
+void rs2_set_amp_factor(rs2_device* dev, const  STAFactor* group, rs2_error** error);
+
+void rs2_get_amp_factor(rs2_device* dev, STAFactor* group, int mode, rs2_error** error);
 
 void rs2_load_json(rs2_device* dev, const void* json_content, unsigned content_size, rs2_error** error) BEGIN_API_CALL
 {

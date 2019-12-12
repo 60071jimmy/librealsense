@@ -8,14 +8,36 @@
 #include "hw-monitor.h"
 #include "sensor.h"
 #include "core/streaming.h"
+#include "command_transfer.h"
 
 #include <chrono>
 #include <memory>
 #include <vector>
 #include <cmath>
+#include <type_traits>
 
 namespace librealsense
 {
+    class observable_option
+    {
+    public:
+        void add_observer(std::function<void(float)> callback)
+        {
+            _callbacks.push_back(callback);
+        }
+
+        void notify(float val)
+        {
+            for (auto callback : _callbacks)
+            {
+                callback(val);
+            }
+        }
+
+    private:
+        std::vector<std::function<void(float)>> _callbacks;
+    };
+
     class readonly_option : public option
     {
     public:
@@ -61,33 +83,51 @@ namespace librealsense
         std::string _desc;
     };
 
+    class LRS_EXTENSION_API option_base : public option
+    {
+    public:
+        option_base(const option_range& opt_range)
+            : _opt_range(opt_range)
+        {}
+
+        bool is_valid(float value) const;
+
+        option_range get_range() const override;
+
+        virtual void enable_recording(std::function<void(const option&)> recording_action) override;
+     protected:
+        const option_range _opt_range;
+        std::function<void(const option&)> _recording_function = [](const option&) {};
+
+    };
+
     template<class T>
-    class ptr_option : public option
+    class LRS_EXTENSION_API ptr_option : public option_base
     {
     public:
         ptr_option(T min, T max, T step, T def, T* value, const std::string& desc)
-            : _min(min), _max(max), _step(step), _def(def), _value(value), _desc(desc)
+            : option_base({ static_cast<float>(min),
+                            static_cast<float>(max),
+                            static_cast<float>(step),
+                            static_cast<float>(def), }),
+            _min(min), _max(max), _step(step), _def(def), _value(value), _desc(desc)
         {
+            static_assert((std::is_arithmetic<T>::value), "ptr_option class supports arithmetic built-in types only");
             _on_set = [](float x) {};
         }
 
-        void set(float value) override 
-        { 
-            if (_max < value || _min > value) 
-                throw invalid_value_exception("Given value is outside valid range!");
-            *_value = value; 
+        void set(float value) override
+        {
+            T val = static_cast<T>(value);
+            if ((_max < val) || (_min > val))
+                throw invalid_value_exception(to_string() << "Given value " << value << "is outside valid range!");
+            *_value = val;
             _on_set(value);
         }
 
-        float query() const override 
+        float query() const override
         {
-            return *_value;
-        }
-
-        option_range get_range() const override { 
-            return{ 
-                (float)_min, (float)_max, 
-                (float)_step, (float)_def }; 
+            return static_cast<float>(*_value);
         }
 
         bool is_enabled() const override { return true; }
@@ -113,11 +153,34 @@ namespace librealsense
 
         void on_set(std::function<void(float)> on_set) { _on_set = on_set; }
     private:
-        T _min, _max, _step, _def;
+        T _min, _max, _step, _def; // stored separately so that logic can be done in base type
         T* _value;
         std::string _desc;
         std::map<float, std::string> _item_desc;
         std::function<void(float)> _on_set;
+    };
+
+    class LRS_EXTENSION_API float_option : public option_base
+    {
+    public:
+        float_option(option_range range) : option_base(range), _value(range.def) {}
+
+        void set(float value) override;
+        float query() const override { return _value; }
+        bool is_enabled() const override { return true; }
+        // TODO: expose this outwards
+        const char* get_description() const override { return "A simple custom option for a processing block"; }
+    protected:
+        float _value;
+    };
+
+    class LRS_EXTENSION_API bool_option : public float_option
+    {
+    public:
+        bool_option() : float_option(option_range{ 0, 1, 1, 1 }) {}
+        bool is_true() { return (_value > _opt_range.min); }
+        // TODO: expose this outwards
+        const char* get_description() const override { return "A simple custom option for a processing block"; }
     };
 
     class uvc_pu_option : public option
@@ -199,7 +262,7 @@ namespace librealsense
                 {
                     return dev.get_xu_range(_xu, _id, sizeof(T));
                 });
-            
+
             if (uvc_range.min.size() < sizeof(int32_t)) return option_range{0,0,1,0};
 
             auto min = *(reinterpret_cast<int32_t*>(uvc_range.min.data()));
@@ -218,6 +281,10 @@ namespace librealsense
             : _ep(ep), _xu(xu), _id(id), _desciption(std::move(description))
         {}
 
+        uvc_xu_option(uvc_sensor& ep, platform::extension_unit xu, uint8_t id, std::string description, const std::map<float, std::string>& description_per_value)
+            : _ep(ep), _xu(xu), _id(id), _desciption(std::move(description)), _description_per_value(description_per_value)
+        {}
+
         const char* get_description() const override
         {
             return _desciption.c_str();
@@ -226,33 +293,20 @@ namespace librealsense
         {
             _recording_function = record_action;
         }
+        const char* get_value_description(float val) const override
+        {
+            if (_description_per_value.find(val) != _description_per_value.end())
+                return _description_per_value.at(val).c_str();
+            return nullptr;
+        }
     protected:
         uvc_sensor&       _ep;
         platform::extension_unit _xu;
         uint8_t             _id;
         std::string         _desciption;
         std::function<void(const option&)> _recording_function = [](const option&) {};
+        const std::map<float, std::string> _description_per_value;
     };
-
-    inline std::string hexify(unsigned char n)
-    {
-        std::string res;
-
-        do
-        {
-            res += "0123456789ABCDEF"[n % 16];
-            n >>= 4;
-        } while (n);
-
-        reverse(res.begin(), res.end());
-
-        if (res.size() == 1)
-        {
-            res.insert(0, "0");
-        }
-
-        return res;
-    }
 
     template<class T, class R, class W, class U>
     class struct_field_option : public option
@@ -329,18 +383,18 @@ namespace librealsense
             : _polling_error_handler(handler), _value(1)
         {}
 
-        void set(float value);
+        void set(float value) override;
 
-        float query() const;
+        float query() const override;
 
-        option_range get_range() const;
+        option_range get_range() const override;
 
-        bool is_enabled() const;
+        bool is_enabled() const override;
 
 
-        const char* get_description() const;
+        const char* get_description() const override;
 
-        const char* get_value_description(float value) const;
+        const char* get_value_description(float value) const override;
         void enable_recording(std::function<void(const option &)> record_action) override
         {
             _recording_function = record_action;
@@ -366,7 +420,7 @@ namespace librealsense
        }
        void set(float value) override
        {
-          auto strong = _auto_exposure.lock();
+          auto strong = _affected_control.lock();
           assert(strong);
 
           auto move_to_manual = false;
@@ -408,11 +462,11 @@ namespace librealsense
        }
 
        explicit auto_disabling_control(std::shared_ptr<option> auto_disabling,
-                                       std::shared_ptr<option> auto_exposure,
+                                       std::shared_ptr<option> affected_option,
                                        std::vector<float> move_to_manual_values = {1.f},
                                        float manual_value = 0.f)
 
-           : _auto_disabling_control(auto_disabling), _auto_exposure(auto_exposure),
+           : _auto_disabling_control(auto_disabling), _affected_control(affected_option),
              _move_to_manual_values(move_to_manual_values), _manual_value(manual_value)
        {}
        void enable_recording(std::function<void(const option &)> record_action) override
@@ -421,42 +475,9 @@ namespace librealsense
        }
    private:
        std::shared_ptr<option> _auto_disabling_control;
-       std::weak_ptr<option>   _auto_exposure;
+       std::weak_ptr<option>   _affected_control;
        std::vector<float>      _move_to_manual_values;
        float                   _manual_value;
        std::function<void(const option&)> _recording_function = [](const option&) {};
-   };
-
-   class option_base : public option
-   {
-   public:
-       option_base(const option_range& opt_range)
-           : _opt_range(opt_range)
-       {}
-
-       bool is_valid(float value) const
-       {
-           if (!std::isnormal(_opt_range.step))
-               throw invalid_value_exception(to_string() << "is_valid(...) failed! step is not properly defined. (" << _opt_range.step << ")");
-
-           if ((value < _opt_range.min) || (value > _opt_range.max))
-               return false;
-
-           auto n = (value - _opt_range.min)/_opt_range.step;
-           return (fabs(fmod(n, 1)) < std::numeric_limits<float>::min());
-       }
-
-       option_range get_range() const override
-       {
-           return _opt_range;
-       }
-       virtual void enable_recording(std::function<void(const option&)> recording_action) override
-       {
-           _recording_function = recording_action;
-       }
-    protected:
-       const option_range _opt_range;
-       std::function<void(const option&)> _recording_function = [](const option&) {};
-
    };
 }

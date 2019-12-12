@@ -14,7 +14,7 @@
 
 using namespace std;
 using namespace TCLAP;
-using namespace rs2;
+
 
 vector<uint8_t> build_raw_command_data(const command& command, const vector<string>& params)
 {
@@ -37,7 +37,7 @@ vector<uint8_t> build_raw_command_data(const command& command, const vector<stri
     return raw_data;
 }
 
-void xml_mode(const string& line, const commands_xml& cmd_xml, device& dev, map<string, xml_parser_function>& format_type_to_lambda)
+void xml_mode(const string& line, const commands_xml& cmd_xml, rs2::device& dev, map<string, xml_parser_function>& format_type_to_lambda)
 {
     vector<string> tokens;
     stringstream ss(line);
@@ -48,6 +48,7 @@ void xml_mode(const string& line, const commands_xml& cmd_xml, device& dev, map<
         converter << hex << word;
         tokens.push_back(word);
     }
+
     if (tokens.empty())
         throw runtime_error("Wrong input!");
 
@@ -69,7 +70,7 @@ void xml_mode(const string& line, const commands_xml& cmd_xml, device& dev, map<
     }
     cout << endl;
 
-    auto result = dev.as<debug_protocol>().send_and_receive_raw_data(raw_data);
+    auto result = dev.as<rs2::debug_protocol>().send_and_receive_raw_data(raw_data);
 
     unsigned returned_opcode = *result.data();
     // check returned opcode
@@ -92,7 +93,7 @@ void xml_mode(const string& line, const commands_xml& cmd_xml, device& dev, map<
     }
 }
 
-void hex_mode(const string& line, device& dev)
+void hex_mode(const string& line, rs2::device& dev)
 {
     vector<uint8_t> raw_data;
     stringstream ss(line);
@@ -108,7 +109,7 @@ void hex_mode(const string& line, device& dev)
     if (raw_data.empty())
         throw runtime_error("Wrong input!");
 
-    auto result = dev.as<debug_protocol>().send_and_receive_raw_data(raw_data);
+    auto result = dev.as<rs2::debug_protocol>().send_and_receive_raw_data(raw_data);
 
     cout << endl;
     for (auto& elem : result)
@@ -141,11 +142,16 @@ void read_script_file(const string& full_file_path, vector<string>& hex_lines)
     throw runtime_error("Script file not found!");
 }
 
-device wait_for_device(const device_hub& hub)
+rs2::device wait_for_device(const rs2::device_hub& hub, bool print_info = true)
 {
-    cout << "\nWaiting for RealSense device to connect...\n";
+    if (print_info)
+        cout << "\nWaiting for RealSense device to connect...\n";
+
     auto dev = hub.wait_for_device();
-    cout << "RealSense device has connected...\n";
+
+    if (print_info)
+        cout << "RealSense device has connected...\n";
+
     return dev;
 }
 
@@ -154,26 +160,54 @@ int main(int argc, char** argv)
     CmdLine cmd("librealsense rs-terminal example tool", ' ', RS2_API_VERSION_STR);
     ValueArg<string> xml_arg("l", "load", "Full file path of commands XML file", false, "", "Load commands XML file");
     ValueArg<int> device_id_arg("d", "deviceId", "Device ID could be obtain from rs-enumerate-devices example", false, 0, "Select a device to work with");
+    ValueArg<string> specific_SN_arg("n", "serialNum", "Serial Number can be obtain from rs-enumerate-devices example", false, "", "Select a device serial number to work with");
+    SwitchArg all_devices_arg("a", "allDevices", "Do this command to all attached Realsense Devices", false);
     ValueArg<string> hex_cmd_arg("s", "send", "Hexadecimal raw data", false, "", "Send hexadecimal raw data to device");
     ValueArg<string> hex_script_arg("r", "raw", "Full file path of hexadecimal raw data script", false, "", "Send raw data line by line from script file");
     ValueArg<string> commands_script_arg("c", "cmd", "Full file path of commands script", false, "", "Send commands line by line from script file");
     cmd.add(xml_arg);
     cmd.add(device_id_arg);
+    cmd.add(specific_SN_arg);
+    cmd.add(all_devices_arg);
     cmd.add(hex_cmd_arg);
     cmd.add(hex_script_arg);
     cmd.add(commands_script_arg);
     cmd.parse(argc, argv);
 
     // parse command.xml
-    log_to_file(RS2_LOG_SEVERITY_WARN, "librealsense.log");
+    rs2::log_to_file(RS2_LOG_SEVERITY_WARN, "librealsense.log");
     // Obtain a list of devices currently present on the system
-    context ctx;
-    device_hub hub(ctx);
+    rs2::context ctx = rs2::context();
+    rs2::device_hub hub(ctx);
+    rs2::device_list all_device_list = ctx.query_devices();
+    if (all_device_list.size() == 0) {
+        std::cout << "\nLibrealsense is not detecting any devices" << std::endl;
+        return EXIT_FAILURE;
+    };
+
+    std::vector<rs2::device> rs_device_list;
+    //Ensure that diviceList only has realsense devices in it. tmpList contains webcams as well
+    for (size_t i = 0; i < all_device_list.size(); i++) {
+        try {
+            all_device_list[i].get_info(RS2_CAMERA_INFO_FIRMWARE_VERSION);
+            rs_device_list.push_back(all_device_list[i]);
+        }
+        catch (...) {
+            continue;
+        }
+
+    }
+    auto num_rs_devices = rs_device_list.size();
+    if (rs_device_list.size() == 0) {
+        std::cout << "\nLibrealsense is not detecting any Realsense cameras" << std::endl;
+        return EXIT_FAILURE;
+    };
 
     auto xml_full_file_path = xml_arg.getValue();
     map<string, xml_parser_function> format_type_to_lambda;
     commands_xml cmd_xml;
     auto is_application_in_hex_mode = true;
+
     if (!xml_full_file_path.empty())
     {
         auto sts = parse_xml_from_file(xml_full_file_path, cmd_xml);
@@ -195,22 +229,83 @@ int main(int argc, char** argv)
     }
     auto auto_comp = get_auto_complete_obj(is_application_in_hex_mode, cmd_xml.commands);
 
+
+    std::vector<rs2::device> selected_rs_devices;
     while (true)
     {
-        auto dev = wait_for_device(hub);
-        fflush(nullptr);
+        if (all_devices_arg.isSet()) {
+            for (size_t i = 0; i < num_rs_devices; i++) {
+                std::string sn = std::string(rs_device_list[i].get_info(RS2_CAMERA_INFO_SERIAL_NUMBER));
+                selected_rs_devices.push_back(rs_device_list[i]);
+                std::cout << "\nDevice with Serial Number:  " << rs_device_list[i].get_info(RS2_CAMERA_INFO_SERIAL_NUMBER) << " has loaded.\n";
+            }
+        }
+        else if (specific_SN_arg.isSet()) {
+            auto desired_sn = specific_SN_arg.getValue();
+            bool device_not_found = true;
+            for (size_t i = 0; i < num_rs_devices; i++) {
+                std::string device_sn = std::string(rs_device_list[i].get_info(RS2_CAMERA_INFO_SERIAL_NUMBER));
+                if (device_sn.compare(desired_sn) == 0) { //std::compare returns 0 if the strings are the same
+                    selected_rs_devices.push_back(rs_device_list[i]);
+                    device_not_found = false;
+                    std::cout << "\nDevice with SN:  " << device_sn << " has loaded.\n";
+                    break;
+                }
+            }
+            if (device_not_found) {
+                std::cout << "\nGiven device serial number doesn't exist! desired serial number=" << desired_sn << std::endl;
+                return EXIT_FAILURE;
+            }
 
+        }
+        else if (device_id_arg.isSet())
+        {
+            auto dev_id = device_id_arg.getValue();
+            if (num_rs_devices < (dev_id + 1))
+            {
+                std::cout << "\nGiven device_id doesn't exist! device_id=" <<
+                    dev_id << " ; connected devices=" << num_rs_devices << std::endl;
+                return EXIT_FAILURE;
+            }
+
+            for (int i = 0; i < (num_rs_devices - 1); ++i)
+            {
+                wait_for_device(hub, true);
+            }
+            selected_rs_devices.push_back(rs_device_list[dev_id]);
+            std::cout << "\nDevice ID " << dev_id << " has loaded.\n";
+        }
+        else if (rs_device_list.size() == 1)
+        {
+            selected_rs_devices.push_back(rs_device_list[0]);
+        }
+        else
+        {
+            std::cout << "\nEnter a command line option:" << std::endl;
+            std::cout << "-d to choose by device number" << std::endl;
+            std::cout << "-n to choose by serial number" << std::endl;
+            std::cout << "-a to send to all devices" << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        if (selected_rs_devices.empty()) {
+            std::cout << "\nNo devices were selected. Recheck input arguments" << std::endl;
+            return EXIT_FAILURE;
+        }
+        fflush(nullptr);
         if (hex_cmd_arg.isSet())
         {
-            auto line = hex_cmd_arg.getValue();
-            try
-            {
-                hex_mode(line, dev);
-            }
-            catch (const exception& ex)
-            {
-                cout << endl << ex.what() << endl;
-                continue;
+            for (auto dev : selected_rs_devices) {
+                auto line = hex_cmd_arg.getValue();
+                try
+                {
+                    hex_mode(line, dev);
+                }
+                catch (const exception& ex)
+                {
+                    cout << endl << ex.what() << endl;
+                    continue;
+                }
             }
             return EXIT_SUCCESS;
 
@@ -232,15 +327,17 @@ int main(int argc, char** argv)
 
         if (hex_script_arg.isSet())
         {
-            try
-            {
-                for (auto& elem : script_lines)
-                    hex_mode(elem, dev);
-            }
-            catch (const exception& ex)
-            {
-                cout << endl << ex.what() << endl;
-                continue;
+            for (auto dev : selected_rs_devices) {
+                try
+                {
+                    for (auto& elem : script_lines)
+                        hex_mode(elem, dev);
+                }
+                catch (const exception& ex)
+                {
+                    cout << endl << ex.what() << endl;
+                    continue;
+                }
             }
             return EXIT_SUCCESS;
         }
@@ -250,22 +347,22 @@ int main(int argc, char** argv)
 
         if (commands_script_arg.isSet())
         {
-            try
-            {
-                for (auto& elem : script_lines)
-                    xml_mode(elem, cmd_xml, dev, format_type_to_lambda);
-            }
-            catch (const exception& ex)
-            {
-                cout << endl << ex.what() << endl;
-                continue;
+            for (auto dev : selected_rs_devices) {
+                try
+                {
+                    for (auto& elem : script_lines)
+                        xml_mode(elem, cmd_xml, dev, format_type_to_lambda);
+                }
+                catch (const exception& ex)
+                {
+                    cout << endl << ex.what() << endl;
+                    continue;
+                }
             }
             return EXIT_SUCCESS;
         }
 
-
-
-
+        auto dev = selected_rs_devices[0];
         while (hub.is_connected(dev))
         {
             try
@@ -273,8 +370,6 @@ int main(int argc, char** argv)
                 cout << "\n\n#>";
                 fflush(nullptr);
                 string line = "";
-
-
                 line = auto_comp.get_line([&]() {return !hub.is_connected(dev); });
                 if (!hub.is_connected(dev))
                     continue;
@@ -289,18 +384,24 @@ int main(int argc, char** argv)
                 {
                     return EXIT_SUCCESS;
                 }
-                if (is_application_in_hex_mode)
-                {
-                    hex_mode(line, dev);
-                }
-                else
-                {
-                    xml_mode(line, cmd_xml, dev, format_type_to_lambda);
-                }
 
-                cout << endl;
+                for (auto&& dev : selected_rs_devices)
+                {
+                    if (!hub.is_connected(dev))
+                        continue;
+
+                    if (is_application_in_hex_mode)
+                    {
+                        hex_mode(line, dev);
+                    }
+                    else
+                    {
+                        xml_mode(line, cmd_xml, dev, format_type_to_lambda);
+                    }
+                    cout << endl;
+                }
             }
-            catch (const error & e)
+            catch (const rs2::error & e)
             {
                 cerr << "RealSense error calling " << e.get_failed_function() << "(" << e.get_failed_args() << "):\n    " << e.what() << endl;
             }

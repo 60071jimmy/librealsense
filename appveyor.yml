@@ -30,7 +30,7 @@ before_build:
 - cmd: >-
     cd c:\projects\librealsense && mkdir build && cd build
 
-    cmake .. -DBUILD_EXAMPLES=true -DBUILD_PYTHON_BINDINGS=true -DBUILD_NODEJS_BINDINGS:BOOL=true
+    cmake .. -DBUILD_EXAMPLES=true -DBUILD_PYTHON_BINDINGS=true -DBUILD_NODEJS_BINDINGS:BOOL=true -DBUILD_UNIT_TESTS:BOOL=true
 build:
   project: ./build/librealsense2.sln
   parallel: true                           # Is not in use on "Free" plans -  https://github.com/appveyor/ci/issues/216. Leaved for future consideration
@@ -63,7 +63,7 @@ build:
 #
 test_script:
 - ps: >-
-    $url_records_path = "http://realsense-hw-public.s3.amazonaws.com/rs-tests/1/"
+    $url_records_path = "http://realsense-hw-public.s3.amazonaws.com/rs-tests/lrs_2.8.3/"
 
     $url_records_list = $url_records_path + "records.txt"
 
@@ -86,6 +86,13 @@ test_script:
     }
 
     $test_failed = @()
+
+    & cmd.exe /c C:/projects/librealsense/build/Debug/live-test.exe -d yes -i [software-device]
+
+    if ($LASTEXITCODE -ne 0)
+    {
+        $test_failed +=  "software-device"
+    }
 
     foreach ($element in $records) 
     {

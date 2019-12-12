@@ -38,7 +38,8 @@
 #include <signal.h>
 #include <assert.h>
 #include <iomanip>
-
+#include <map>
+#include <tuple>
 #include <boost/foreach.hpp>
 
 #include "console_bridge/console.h"
@@ -53,8 +54,8 @@ using std::vector;
 using std::multiset;
 using boost::format;
 using std::shared_ptr;
-using ros::M_string;
-using ros::Time;
+using rs2rosinternal::M_string;
+using rs2rosinternal::Time;
 
 namespace rosbag {
 
@@ -195,6 +196,48 @@ void Bag::setChunkThreshold(uint32_t chunk_threshold) {
 
 CompressionType Bag::getCompression() const { return compression_; }
 
+std::tuple<std::string, uint64_t, uint64_t> Bag::getCompressionInfo() const
+{
+    std::map<std::string, uint64_t> compression_counts;
+    std::map<std::string, uint64_t> compression_uncompressed;
+    std::map<std::string, uint64_t> compression_compressed;
+    auto compression = compression_;
+    uint64_t uncompressed = 0;
+    uint64_t compressed = 0;
+    ChunkInfo curr_chunk_info;
+    foreach(ChunkInfo const& chunk_info, chunks_) {
+        curr_chunk_info = chunk_info;
+
+        seek(curr_chunk_info.pos);
+
+        // Skip over the chunk data
+        ChunkHeader chunk_header;
+        readChunkHeader(chunk_header);
+        seek(chunk_header.compressed_size, std::ios::cur);
+
+        compression_counts[chunk_header.compression] += 1;
+        compression_uncompressed[chunk_header.compression] += chunk_header.uncompressed_size;
+        uncompressed += chunk_header.uncompressed_size;
+        compression_compressed[chunk_header.compression] += chunk_header.compressed_size;
+        compressed += chunk_header.compressed_size;
+    }
+
+    auto chunk_count = chunks_.size();
+    uint64_t main_compression_count = 0;
+    std::string main_compression;
+    for (auto&& kvp : compression_counts)
+    {
+        if (kvp.second > main_compression_count)
+        {
+            main_compression = kvp.first;
+            main_compression_count = kvp.second;
+        }
+    }
+    //auto main_compression_str = compression_counts.begin()->first;
+    //CompressionType main_compression = (main_compression_str == "Uncompressed") ? CompressionType::Uncompressed : (main_compression_str == "LZ4") ? CompressionType::LZ4 : CompressionType::BZ2;
+    //auto main_compression_count = compression_counts.begin()->second;
+    return std::make_tuple(main_compression, compressed, uncompressed);
+}
 void Bag::setCompression(CompressionType compression) {
     if (file_.isOpen() && chunk_open_)
         stopWritingChunk();
@@ -352,7 +395,7 @@ void Bag::writeFileHeaderRecord() {
 
     std::vector<uint8_t> header_buffer;
     uint32_t header_len;
-    ros::Header::write(header, header_buffer, header_len);
+    rs2rosinternal::Header::write(header, header_buffer, header_len);
     uint32_t data_len = 0;
     if (header_len < FILE_HEADER_LENGTH)
         data_len = FILE_HEADER_LENGTH - header_len;
@@ -369,7 +412,7 @@ void Bag::writeFileHeaderRecord() {
 }
 
 void Bag::readFileHeaderRecord() {
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     if (!readHeader(header) || !readDataLength(data_size))
         throw BagFormatException("Error reading FILE_HEADER record");
@@ -474,7 +517,7 @@ void Bag::writeChunkHeader(CompressionType compression, uint32_t compressed_size
 }
 
 void Bag::readChunkHeader(ChunkHeader& chunk_header) const {
-    ros::Header header;
+    rs2rosinternal::Header header;
     if (!readHeader(header) || !readDataLength(chunk_header.compressed_size))
         throw BagFormatException("Error reading CHUNK record");
 
@@ -521,7 +564,7 @@ void Bag::writeIndexRecords() {
 }
 
 void Bag::readTopicIndexRecord102() {
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     if (!readHeader(header) || !readDataLength(data_size))
         throw BagFormatException("Error reading INDEX_DATA header");
@@ -572,7 +615,7 @@ void Bag::readTopicIndexRecord102() {
 
         CONSOLE_BRIDGE_logDebug("  - %d.%d: %llu", sec, nsec, (unsigned long long) index_entry.chunk_pos);
 
-        if (index_entry.time < ros::TIME_MIN || index_entry.time > ros::TIME_MAX)
+        if (index_entry.time < rs2rosinternal::TIME_MIN || index_entry.time > rs2rosinternal::TIME_MAX)
         {
           CONSOLE_BRIDGE_logError("Index entry for topic %s contains invalid time.", topic.c_str());
         } else
@@ -583,7 +626,7 @@ void Bag::readTopicIndexRecord102() {
 }
 
 void Bag::readConnectionIndexRecord200() {
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     if (!readHeader(header) || !readDataLength(data_size))
         throw BagFormatException("Error reading INDEX_DATA header");
@@ -620,7 +663,7 @@ void Bag::readConnectionIndexRecord200() {
 
         CONSOLE_BRIDGE_logDebug("  - %d.%d: %llu+%d", sec, nsec, (unsigned long long) index_entry.chunk_pos, index_entry.offset);
 
-        if (index_entry.time < ros::TIME_MIN || index_entry.time > ros::TIME_MAX)
+        if (index_entry.time < rs2rosinternal::TIME_MIN || index_entry.time > rs2rosinternal::TIME_MAX)
         {
             CONSOLE_BRIDGE_logError("Index entry for topic %s contains invalid time.  This message will not be loaded.", connections_[connection_id]->topic.c_str());
         } else
@@ -663,7 +706,7 @@ void Bag::appendConnectionRecordToBuffer(Buffer& buf, ConnectionInfo const* conn
 }
 
 void Bag::readConnectionRecord() {
-    ros::Header header;
+    rs2rosinternal::Header header;
     if (!readHeader(header))
         throw BagFormatException("Error reading CONNECTION header");
     M_string& fields = *header.getValues();
@@ -676,7 +719,7 @@ void Bag::readConnectionRecord() {
     string topic;
     readField(fields, TOPIC_FIELD_NAME,      true, topic);
 
-    ros::Header connection_header;
+    rs2rosinternal::Header connection_header;
     if (!readHeader(connection_header))
         throw BagFormatException("Error reading connection header");
 
@@ -699,7 +742,7 @@ void Bag::readConnectionRecord() {
 }
 
 void Bag::readMessageDefinitionRecord102() {
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     if (!readHeader(header) || !readDataLength(data_size))
         throw BagFormatException("Error reading message definition header");
@@ -734,7 +777,7 @@ void Bag::readMessageDefinitionRecord102() {
     connection_info->msg_def  = message_definition;
     connection_info->datatype = datatype;
     connection_info->md5sum   = md5sum;
-    connection_info->header = std::make_shared<ros::M_string>();
+    connection_info->header = std::make_shared<rs2rosinternal::M_string>();
     (*connection_info->header)["type"]               = connection_info->datatype;
     (*connection_info->header)["md5sum"]             = connection_info->md5sum;
     (*connection_info->header)["message_definition"] = connection_info->msg_def;
@@ -773,7 +816,7 @@ void Bag::decompressChunk(uint64_t chunk_pos) const {
     decompressed_chunk_ = chunk_pos;
 }
 
-void Bag::readMessageDataRecord102(uint64_t offset, ros::Header& header) const {
+void Bag::readMessageDataRecord102(uint64_t offset, rs2rosinternal::Header& header) const {
     CONSOLE_BRIDGE_logDebug("readMessageDataRecord: offset=%llu", (unsigned long long) offset);
 
     seek(offset);
@@ -841,8 +884,8 @@ void Bag::decompressLz4Chunk(ChunkHeader const& chunk_header) const {
     // todo check read was successful
 }
 
-ros::Header Bag::readMessageDataHeader(IndexEntry const& index_entry) {
-    ros::Header header;
+rs2rosinternal::Header Bag::readMessageDataHeader(IndexEntry const& index_entry) {
+    rs2rosinternal::Header header;
     uint32_t data_size;
     uint32_t bytes_read;
     switch (version_)
@@ -861,7 +904,7 @@ ros::Header Bag::readMessageDataHeader(IndexEntry const& index_entry) {
 
 // NOTE: this loads the header, which is unnecessary
 uint32_t Bag::readMessageDataSize(IndexEntry const& index_entry) const {
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     uint32_t bytes_read;
     switch (version_)
@@ -913,7 +956,7 @@ void Bag::writeChunkInfoRecords() {
 
 void Bag::readChunkInfoRecord() {
     // Read a CHUNK_INFO header
-    ros::Header header;
+    rs2rosinternal::Header header;
     uint32_t data_size;
     if (!readHeader(header) || !readDataLength(data_size))
         throw BagFormatException("Error reading CHUNK_INFO record header");
@@ -965,7 +1008,7 @@ bool Bag::isOp(M_string& fields, uint8_t reqOp) const {
 void Bag::writeHeader(M_string const& fields) {
 	std::vector<uint8_t> header_buffer;
     uint32_t header_len;
-    ros::Header::write(fields, header_buffer, header_len);
+    rs2rosinternal::Header::write(fields, header_buffer, header_len);
     write((char*) &header_len, 4);
     write((char*) header_buffer.data(), header_len);
 }
@@ -977,7 +1020,7 @@ void Bag::writeDataLength(uint32_t data_len) {
 void Bag::appendHeaderToBuffer(Buffer& buf, M_string const& fields) {
 	std::vector<uint8_t> header_buffer;
     uint32_t header_len;
-    ros::Header::write(fields, header_buffer, header_len);
+    rs2rosinternal::Header::write(fields, header_buffer, header_len);
 
     uint32_t offset = buf.getSize();
 
@@ -997,7 +1040,7 @@ void Bag::appendDataLengthToBuffer(Buffer& buf, uint32_t data_len) {
 }
 
 //! \todo clean this up
-void Bag::readHeaderFromBuffer(Buffer& buffer, uint32_t offset, ros::Header& header, uint32_t& data_size, uint32_t& bytes_read) const {
+void Bag::readHeaderFromBuffer(Buffer& buffer, uint32_t offset, rs2rosinternal::Header& header, uint32_t& data_size, uint32_t& bytes_read) const {
     assert(buffer.getSize() > 8);
 
     uint8_t* start = (uint8_t*) buffer.getData() + offset;
@@ -1023,7 +1066,7 @@ void Bag::readHeaderFromBuffer(Buffer& buffer, uint32_t offset, ros::Header& hea
     bytes_read = static_cast<uint32_t>(ptr - start);
 }
 
-void Bag::readMessageDataHeaderFromBuffer(Buffer& buffer, uint32_t offset, ros::Header& header, uint32_t& data_size, uint32_t& total_bytes_read) const {
+void Bag::readMessageDataHeaderFromBuffer(Buffer& buffer, uint32_t offset, rs2rosinternal::Header& header, uint32_t& data_size, uint32_t& total_bytes_read) const {
     (void)buffer;
     total_bytes_read = 0;
     uint8_t op = 0xFF;
@@ -1043,7 +1086,7 @@ void Bag::readMessageDataHeaderFromBuffer(Buffer& buffer, uint32_t offset, ros::
         throw BagFormatException("Expected MSG_DATA op not found");
 }
 
-bool Bag::readHeader(ros::Header& header) const {
+bool Bag::readHeader(rs2rosinternal::Header& header) const {
     // Read the header length
     uint32_t header_len;
     read((char*) &header_len, 4);

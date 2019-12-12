@@ -62,7 +62,7 @@
  ** Namespaces
  *********************************************************************/
 
-namespace ros
+namespace rs2rosinternal
 {
 
   /*********************************************************************
@@ -197,7 +197,7 @@ namespace ros
       }
     return 0;
 #else
-    timespec req = { sec, nsec };
+    timespec req = { static_cast<time_t>(sec), static_cast<long>(nsec) };
     return nanosleep(&req, NULL);
 #endif
   }
@@ -212,7 +212,7 @@ namespace ros
 #if defined(WIN32)
     ros_nanosleep(sec,nsec);
 #else
-    timespec req = { sec, nsec };
+    timespec req = { static_cast<time_t>(sec), static_cast<long>(nsec) };
     timespec rem = {0, 0};
     while (nanosleep(&req, &rem) && !g_stopped)
       {
@@ -288,17 +288,17 @@ namespace ros
 
   bool Time::waitForValid()
   {
-    return waitForValid(ros::WallDuration());
+    return waitForValid(rs2rosinternal::WallDuration());
   }
 
-  bool Time::waitForValid(const ros::WallDuration& timeout)
+  bool Time::waitForValid(const rs2rosinternal::WallDuration& timeout)
   {
-    ros::WallTime start = ros::WallTime::now();
+    rs2rosinternal::WallTime start = rs2rosinternal::WallTime::now();
     while (!isValid() && !g_stopped)
       {
-        ros::WallDuration(0.01).sleep();
+        rs2rosinternal::WallDuration(0.01).sleep();
 
-        if (timeout > ros::WallDuration(0, 0) && (ros::WallTime::now() - start > timeout))
+        if (timeout > rs2rosinternal::WallDuration(0, 0) && (rs2rosinternal::WallTime::now() - start > timeout))
           {
             return false;
           }

@@ -2,8 +2,6 @@
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 
 #include "types.h"
-#include "device.h"
-#include "archive.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -11,15 +9,20 @@
 #include <fstream>
 #include <cmath>
 
+#include "core/streaming.h"
+#include "../include/librealsense2/hpp/rs_processing.hpp"
+
 #define STRCASE(T, X) case RS2_##T##_##X: {\
-        static std::string s##T##_##X##_str = make_less_screamy(#X);\
+        static const std::string s##T##_##X##_str = make_less_screamy(#X);\
         return s##T##_##X##_str.c_str(); }
+
+const double SQRT_DBL_EPSILON = sqrt(std::numeric_limits<double>::epsilon());
 
 namespace librealsense
 {
     std::string make_less_screamy(const char* str)
     {
-        std::string res = str;
+        std::string res(str);
 
         bool first = true;
         for (auto i = 0; i < res.size(); i++)
@@ -37,17 +40,6 @@ namespace librealsense
         }
 
         return res;
-    }
-
-
-    std::string datetime_string()
-    {
-        auto t = time(nullptr);
-        char buffer[20] = {};
-        const tm* time = localtime(&t);
-        if (nullptr != time)
-            strftime(buffer, sizeof(buffer), "%Y-%m-%d-%H_%M_%S", time);
-        return to_string() << buffer;
     }
 
     recoverable_exception::recoverable_exception(const std::string& msg,
@@ -91,42 +83,45 @@ namespace librealsense
 
     const char* get_string(rs2_exception_type value)
     {
-        #define CASE(X) STRCASE(EXCEPTION_TYPE, X)
+#define CASE(X) STRCASE(EXCEPTION_TYPE, X)
         switch(value)
         {
-        CASE(UNKNOWN)
-        CASE(CAMERA_DISCONNECTED)
-        CASE(BACKEND)
-        CASE(INVALID_VALUE)
-        CASE(WRONG_API_CALL_SEQUENCE)
-        CASE(NOT_IMPLEMENTED)
-        CASE(DEVICE_IN_RECOVERY_MODE)
+            CASE(UNKNOWN)
+            CASE(CAMERA_DISCONNECTED)
+            CASE(BACKEND)
+            CASE(INVALID_VALUE)
+            CASE(WRONG_API_CALL_SEQUENCE)
+            CASE(NOT_IMPLEMENTED)
+            CASE(DEVICE_IN_RECOVERY_MODE)
+            CASE(IO)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_stream value)
     {
-        #define CASE(X) STRCASE(STREAM, X)
-        switch(value)
+#define CASE(X) STRCASE(STREAM, X)
+        switch (value)
         {
-        STRCASE(STREAM, ANY)
-        STRCASE(STREAM, DEPTH)
-        STRCASE(STREAM, COLOR)
-        STRCASE(STREAM, INFRARED)
-        STRCASE(STREAM, FISHEYE)
-        STRCASE(STREAM, GYRO)
-        STRCASE(STREAM, ACCEL)
-        STRCASE(STREAM, GPIO)
+            CASE(ANY)
+            CASE(DEPTH)
+            CASE(COLOR)
+            CASE(INFRARED)
+            CASE(FISHEYE)
+            CASE(GYRO)
+            CASE(ACCEL)
+            CASE(GPIO)
+            CASE(POSE)
+            CASE(CONFIDENCE)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_sr300_visual_preset value)
     {
-        #define CASE(X) STRCASE(SR300_VISUAL_PRESET, X)
+#define CASE(X) STRCASE(SR300_VISUAL_PRESET, X)
         switch (value)
         {
             CASE(SHORT_RANGE)
@@ -142,19 +137,19 @@ namespace librealsense
             CASE(IR_ONLY)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_extension value)
     {
-        #define CASE(X) STRCASE(EXTENSION, X)
+#define CASE(X) STRCASE(EXTENSION, X)
         switch (value)
         {
             CASE(UNKNOWN)
             CASE(DEBUG)
             CASE(INFO)
-            CASE(MOTION)
             CASE(OPTIONS)
+            CASE(MOTION)
             CASE(VIDEO)
             CASE(ROI)
             CASE(DEPTH_SENSOR)
@@ -167,9 +162,34 @@ namespace librealsense
             CASE(RECORD)
             CASE(VIDEO_PROFILE)
             CASE(PLAYBACK)
+            CASE(DEPTH_STEREO_SENSOR)
+            CASE(DISPARITY_FRAME)
+            CASE(MOTION_PROFILE)
+            CASE(POSE_FRAME)
+            CASE(POSE_PROFILE)
+            CASE(TM2)
+            CASE(SOFTWARE_DEVICE)
+            CASE(SOFTWARE_SENSOR)
+            CASE(DECIMATION_FILTER)
+            CASE(THRESHOLD_FILTER)
+            CASE(DISPARITY_FILTER)
+            CASE(SPATIAL_FILTER)
+            CASE(TEMPORAL_FILTER)
+            CASE(HOLE_FILLING_FILTER)
+            CASE(ZERO_ORDER_FILTER)
+            CASE(RECOMMENDED_FILTERS)
+            CASE(POSE)
+            CASE(POSE_SENSOR)
+            CASE(WHEEL_ODOMETER)
+            CASE(UPDATABLE)
+            CASE(UPDATE_DEVICE)
+            CASE(GLOBAL_TIMER)
+            CASE(L500_DEPTH_SENSOR)
+            CASE(TM2_SENSOR)
+            CASE(AUTO_CALIBRATED_DEVICE)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_playback_status value)
@@ -181,7 +201,7 @@ namespace librealsense
             CASE(STOPPED)
             CASE(PAUSED)
             CASE(PLAYING)
-            default: assert(!is_valid(value)); return UNKNOWN_VALUE;
+        default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
 #undef CASE
     }
@@ -197,116 +217,159 @@ namespace librealsense
             CASE(ERROR)
             CASE(FATAL)
             CASE(NONE)
-            CASE(COUNT)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_option value)
     {
 #define CASE(X) STRCASE(OPTION, X)
-        switch(value)
+        switch (value)
         {
-        CASE(BACKLIGHT_COMPENSATION)
-        CASE(BRIGHTNESS)
-        CASE(CONTRAST)
-        CASE(EXPOSURE)
-        CASE(GAIN)
-        CASE(GAMMA)
-        CASE(HUE)
-        CASE(SATURATION)
-        CASE(SHARPNESS)
-        CASE(WHITE_BALANCE)
-        CASE(ENABLE_AUTO_EXPOSURE)
-        CASE(ENABLE_AUTO_WHITE_BALANCE)
-        CASE(LASER_POWER)
-        CASE(ACCURACY)
-        CASE(MOTION_RANGE)
-        CASE(FILTER_OPTION)
-        CASE(CONFIDENCE_THRESHOLD)
-        CASE(FRAMES_QUEUE_SIZE)
-        CASE(VISUAL_PRESET)
-        CASE(TOTAL_FRAME_DROPS)
-        CASE(EMITTER_ENABLED)
-        CASE(AUTO_EXPOSURE_MODE)
-        CASE(POWER_LINE_FREQUENCY)
-        CASE(ASIC_TEMPERATURE)
-        CASE(ERROR_POLLING_ENABLED)
-        CASE(PROJECTOR_TEMPERATURE)
-        CASE(OUTPUT_TRIGGER_ENABLED)
-        CASE(MOTION_MODULE_TEMPERATURE)
-        CASE(DEPTH_UNITS)
-        CASE(ENABLE_MOTION_CORRECTION)
-        CASE(AUTO_EXPOSURE_PRIORITY)
-        CASE(HISTOGRAM_EQUALIZATION_ENABLED)
-        CASE(MIN_DISTANCE)
-        CASE(MAX_DISTANCE)
-        CASE(COLOR_SCHEME)
+            CASE(BACKLIGHT_COMPENSATION)
+            CASE(BRIGHTNESS)
+            CASE(CONTRAST)
+            CASE(EXPOSURE)
+            CASE(GAIN)
+            CASE(GAMMA)
+            CASE(HUE)
+            CASE(SATURATION)
+            CASE(SHARPNESS)
+            CASE(WHITE_BALANCE)
+            CASE(ENABLE_AUTO_EXPOSURE)
+            CASE(ENABLE_AUTO_WHITE_BALANCE)
+            CASE(LASER_POWER)
+            CASE(ACCURACY)
+            CASE(MOTION_RANGE)
+            CASE(FILTER_OPTION)
+            CASE(CONFIDENCE_THRESHOLD)
+            CASE(FRAMES_QUEUE_SIZE)
+            CASE(VISUAL_PRESET)
+            CASE(TOTAL_FRAME_DROPS)
+            CASE(EMITTER_ENABLED)
+            CASE(AUTO_EXPOSURE_MODE)
+            CASE(POWER_LINE_FREQUENCY)
+            CASE(ASIC_TEMPERATURE)
+            CASE(ERROR_POLLING_ENABLED)
+            CASE(PROJECTOR_TEMPERATURE)
+            CASE(OUTPUT_TRIGGER_ENABLED)
+            CASE(MOTION_MODULE_TEMPERATURE)
+            CASE(DEPTH_UNITS)
+            CASE(ENABLE_MOTION_CORRECTION)
+            CASE(AUTO_EXPOSURE_PRIORITY)
+            CASE(HISTOGRAM_EQUALIZATION_ENABLED)
+            CASE(MIN_DISTANCE)
+            CASE(MAX_DISTANCE)
+            CASE(COLOR_SCHEME)
+            CASE(TEXTURE_SOURCE)
+            CASE(FILTER_MAGNITUDE)
+            CASE(FILTER_SMOOTH_ALPHA)
+            CASE(FILTER_SMOOTH_DELTA)
+            CASE(STEREO_BASELINE)
+            CASE(HOLES_FILL)
+            CASE(AUTO_EXPOSURE_CONVERGE_STEP)
+            CASE(INTER_CAM_SYNC_MODE)
+            CASE(STREAM_FILTER)
+            CASE(STREAM_FORMAT_FILTER)
+            CASE(STREAM_INDEX_FILTER)
+            CASE(EMITTER_ON_OFF)
+            CASE(ZERO_ORDER_POINT_X)
+            CASE(ZERO_ORDER_POINT_Y)
+            CASE(LLD_TEMPERATURE)
+            CASE(MC_TEMPERATURE)
+            CASE(MA_TEMPERATURE)
+            CASE(APD_TEMPERATURE)
+            CASE(HARDWARE_PRESET)
+            CASE(GLOBAL_TIME_ENABLED)
+            CASE(ENABLE_MAPPING)
+            CASE(ENABLE_RELOCALIZATION)
+            CASE(ENABLE_POSE_JUMPING)
+            CASE(ENABLE_DYNAMIC_CALIBRATION)
+            CASE(DEPTH_OFFSET)
+            CASE(LED_POWER)
+            CASE(ZERO_ORDER_ENABLED)
+            CASE(ENABLE_MAP_PRESERVATION)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_format value)
     {
 #define CASE(X) case RS2_FORMAT_##X: return #X;
-        switch(value)
+        switch (value)
         {
-        CASE(ANY)
-        CASE(Z16)
-        CASE(DISPARITY16)
-        CASE(XYZ32F)
-        CASE(YUYV)
-        CASE(RGB8)
-        CASE(BGR8)
-        CASE(RGBA8)
-        CASE(BGRA8)
-        CASE(Y8)
-        CASE(Y16)
-        CASE(RAW10)
-        CASE(RAW16)
-        CASE(RAW8)
-        CASE(UYVY)
-        CASE(MOTION_RAW)
-        CASE(MOTION_XYZ32F)
-        CASE(GPIO_RAW)
+            CASE(ANY)
+            CASE(Z16)
+            CASE(DISPARITY16)
+            CASE(DISPARITY32)
+            CASE(XYZ32F)
+            CASE(YUYV)
+            CASE(RGB8)
+            CASE(BGR8)
+            CASE(RGBA8)
+            CASE(BGRA8)
+            CASE(Y8)
+            CASE(Y16)
+            CASE(RAW10)
+            CASE(RAW16)
+            CASE(RAW8)
+            CASE(UYVY)
+            CASE(MOTION_RAW)
+            CASE(MOTION_XYZ32F)
+            CASE(GPIO_RAW)
+            CASE(6DOF)
+            CASE(Y10BPACK)
+            CASE(DISTANCE)
+            CASE(MJPEG)
+            CASE(Y8I)
+            CASE(Y12I)
+            CASE(INZI)
+            CASE(INVI)
+            CASE(W10)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_distortion value)
     {
 #define CASE(X) STRCASE(DISTORTION, X)
-        switch(value)
+        switch (value)
         {
-        CASE(NONE)
-        CASE(MODIFIED_BROWN_CONRADY)
-        CASE(INVERSE_BROWN_CONRADY)
-        CASE(FTHETA)
-        CASE(BROWN_CONRADY)
+            CASE(NONE)
+            CASE(MODIFIED_BROWN_CONRADY)
+            CASE(INVERSE_BROWN_CONRADY)
+            CASE(FTHETA)
+            CASE(BROWN_CONRADY)
+            CASE(KANNALA_BRANDT4)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_camera_info value)
     {
 #define CASE(X) STRCASE(CAMERA_INFO, X)
-        switch(value)
+        switch (value)
         {
-        CASE(NAME)
-        CASE(SERIAL_NUMBER)
-        CASE(FIRMWARE_VERSION)
-        CASE(PHYSICAL_PORT)
-        CASE(DEBUG_OP_CODE)
-        CASE(ADVANCED_MODE)
-        CASE(PRODUCT_ID)
-        CASE(CAMERA_LOCKED)
+            CASE(NAME)
+            CASE(SERIAL_NUMBER)
+            CASE(FIRMWARE_VERSION)
+            CASE(RECOMMENDED_FIRMWARE_VERSION)
+            CASE(PHYSICAL_PORT)
+            CASE(DEBUG_OP_CODE)
+            CASE(ADVANCED_MODE)
+            CASE(PRODUCT_ID)
+            CASE(CAMERA_LOCKED)
+            CASE(PRODUCT_LINE)
+            CASE(USB_TYPE_DESCRIPTOR)
+            CASE(ASIC_SERIAL_NUMBER)
+            CASE(FIRMWARE_UPDATE_ID)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_frame_metadata_value value)
@@ -314,17 +377,41 @@ namespace librealsense
 #define CASE(X) STRCASE(FRAME_METADATA, X)
         switch (value)
         {
-        CASE(FRAME_COUNTER)
-        CASE(FRAME_TIMESTAMP)
-        CASE(SENSOR_TIMESTAMP)
-        CASE(ACTUAL_EXPOSURE)
-        CASE(GAIN_LEVEL)
-        CASE(AUTO_EXPOSURE)
-        CASE(WHITE_BALANCE)
-        CASE(TIME_OF_ARRIVAL)
+            CASE(FRAME_COUNTER)
+            CASE(FRAME_TIMESTAMP)
+            CASE(SENSOR_TIMESTAMP)
+            CASE(ACTUAL_EXPOSURE)
+            CASE(GAIN_LEVEL)
+            CASE(AUTO_EXPOSURE)
+            CASE(WHITE_BALANCE)
+            CASE(TIME_OF_ARRIVAL)
+            CASE(TEMPERATURE)
+            CASE(BACKEND_TIMESTAMP)
+            CASE(ACTUAL_FPS)
+            CASE(FRAME_LASER_POWER)
+            CASE(FRAME_LASER_POWER_MODE)
+            CASE(EXPOSURE_PRIORITY)
+            CASE(EXPOSURE_ROI_LEFT)
+            CASE(EXPOSURE_ROI_RIGHT)
+            CASE(EXPOSURE_ROI_TOP)
+            CASE(EXPOSURE_ROI_BOTTOM)
+            CASE(BRIGHTNESS)
+            CASE(CONTRAST)
+            CASE(SATURATION)
+            CASE(SHARPNESS)
+            CASE(AUTO_WHITE_BALANCE_TEMPERATURE)
+            CASE(BACKLIGHT_COMPENSATION)
+            CASE(GAMMA)
+            CASE(HUE)
+            CASE(MANUAL_WHITE_BALANCE)
+            CASE(POWER_LINE_FREQUENCY)
+            CASE(LOW_LIGHT_COMPENSATION)
+            CASE(FRAME_EMITTER_MODE)
+            CASE(FRAME_LED_POWER)
+
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_timestamp_domain value)
@@ -332,11 +419,12 @@ namespace librealsense
 #define CASE(X) STRCASE(TIMESTAMP_DOMAIN, X)
         switch (value)
         {
-        CASE(HARDWARE_CLOCK)
-        CASE(SYSTEM_TIME)
+            CASE(HARDWARE_CLOCK)
+            CASE(SYSTEM_TIME)
+            CASE(GLOBAL_TIME)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
 
     const char* get_string(rs2_notification_category value)
@@ -344,15 +432,32 @@ namespace librealsense
 #define CASE(X) STRCASE(NOTIFICATION_CATEGORY, X)
         switch (value)
         {
-        CASE(FRAMES_TIMEOUT)
-        CASE(FRAME_CORRUPTED)
-        CASE(HARDWARE_ERROR)
-        CASE(UNKNOWN_ERROR)
+            CASE(FRAMES_TIMEOUT)
+            CASE(FRAME_CORRUPTED)
+            CASE(HARDWARE_ERROR)
+            CASE(HARDWARE_EVENT)
+            CASE(UNKNOWN_ERROR)
+            CASE(FIRMWARE_UPDATE_RECOMMENDED)
+            CASE(POSE_RELOCALIZATION)
         default: assert(!is_valid(value)); return UNKNOWN_VALUE;
         }
-        #undef CASE
+#undef CASE
     }
+    const char* get_string(rs2_matchers value)
+    {
+#define CASE(X) STRCASE(MATCHER, X)
+        switch (value)
+        {
+            CASE(DI)
+            CASE(DI_C)
+            CASE(DLR_C)
+            CASE(DLR)
+            CASE(DEFAULT)
+        default: assert(!is_valid(value)); return UNKNOWN_VALUE;
+        }
 
+#undef CASE
+    }
     std::string firmware_version::to_string() const
     {
         if (is_any) return "any";
@@ -370,7 +475,7 @@ namespace librealsense
         std::vector<std::string> result;
         auto e = str.end();
         auto i = str.begin();
-        while (i != e){
+        while (i != e) {
             i = find_if_not(i, e, [](char c) { return c == '.'; });
             if (i == e) break;
             auto j = find(i, e, '.');
@@ -394,10 +499,10 @@ namespace librealsense
 
         double theta = sqrt(std::inner_product(rot.begin(), rot.end(), rot.begin(), 0.0));
         double r1 = rot[0], r2 = rot[1], r3 = rot[2];
-        if (theta <= sqrt(DBL_EPSILON)) // identityMatrix
+        if (theta <= SQRT_DBL_EPSILON) // identityMatrix
         {
-            rot_mat(0,0) = rot_mat(1, 1) = rot_mat(2, 2) = 1.0;
-            rot_mat(0,1) = rot_mat(0, 2) = rot_mat(1, 0) = rot_mat(1, 2) = rot_mat(2, 0) = rot_mat(2, 1) = 0.0;
+            rot_mat(0, 0) = rot_mat(1, 1) = rot_mat(2, 2) = 1.0;
+            rot_mat(0, 1) = rot_mat(0, 2) = rot_mat(1, 0) = rot_mat(1, 2) = rot_mat(2, 0) = rot_mat(2, 1) = 0.0;
         }
         else
         {
@@ -500,18 +605,18 @@ namespace librealsense
         return ~oldcrc32;
     }
 
-    notifications_proccessor::notifications_proccessor()
+    notifications_processor::notifications_processor()
         :_dispatcher(10), _callback(nullptr , [](rs2_notifications_callback*) {})
     {
     }
 
-    notifications_proccessor::~notifications_proccessor()
+    notifications_processor::~notifications_processor()
     {
         _dispatcher.stop();
     }
 
 
-    void notifications_proccessor::set_callback(notifications_callback_ptr callback)
+    void notifications_processor::set_callback(notifications_callback_ptr callback)
     {
 
         _dispatcher.stop();
@@ -519,6 +624,10 @@ namespace librealsense
         std::lock_guard<std::mutex> lock(_callback_mutex);
         _callback = std::move(callback);
         _dispatcher.start();
+    }
+    notifications_callback_ptr notifications_processor::get_callback() const
+    {
+        return _callback;
     }
 
     void copy(void* dst, void const* src, size_t size)

@@ -103,42 +103,55 @@ namespace librealsense
 
     typedef std::vector<std::shared_ptr<device_info>> devices_info;
 
+    //FW Decl
+    class tm2_context;
+
     class context : public std::enable_shared_from_this<context>
     {
     public:
         explicit context(backend_type type,
             const char* filename = nullptr,
             const char* section = nullptr,
-            rs2_recording_mode mode = RS2_RECORDING_MODE_COUNT);
+            rs2_recording_mode mode = RS2_RECORDING_MODE_COUNT,
+            std::string min_api_version = "0.0.0");
 
-        void stop(){_device_watcher->stop();}
+        void stop(){ if (!_devices_changed_callbacks.size()) _device_watcher->stop();}
         ~context();
-        std::vector<std::shared_ptr<device_info>> query_devices() const;
+        std::vector<std::shared_ptr<device_info>> query_devices(int mask) const;
         const platform::backend& get_backend() const { return *_backend; }
 
         uint64_t register_internal_device_callback(devices_changed_callback_ptr callback);
-        void set_devices_changed_callback(devices_changed_callback_ptr callback);
         void unregister_internal_device_callback(uint64_t cb_id);
+        void set_devices_changed_callback(devices_changed_callback_ptr callback);
 
-        std::vector<std::shared_ptr<device_info>> create_devices(platform::backend_device_group devices, const std::map<std::string, std::shared_ptr<device_info>>& playback_devices) const;
+        std::vector<std::shared_ptr<device_info>> create_devices(platform::backend_device_group devices,
+            const std::map<std::string, std::weak_ptr<device_info>>& playback_devices, int mask) const;
 
-
-
-        std::shared_ptr<device_interface> add_device(const std::string& file);
+        std::shared_ptr<playback_device_info> add_device(const std::string& file);
         void remove_device(const std::string& file);
 
-    private:
-        void on_device_changed(platform::backend_device_group old, platform::backend_device_group curr, const std::map<std::string, std::shared_ptr<device_info>>& old_playback_devices, const std::map<std::string, std::shared_ptr<device_info>>& new_playback_devices);
+        void add_software_device(std::shared_ptr<device_info> software_device);
 
+#if WITH_TRACKING
+        void unload_tracking_module();
+#endif
+
+    private:
+        void on_device_changed(platform::backend_device_group old,
+                               platform::backend_device_group curr,
+                               const std::map<std::string, std::weak_ptr<device_info>>& old_playback_devices,
+                               const std::map<std::string, std::weak_ptr<device_info>>& new_playback_devices);
+        void raise_devices_changed(const std::vector<rs2_device_info>& removed, const std::vector<rs2_device_info>& added);
         int find_stream_profile(const stream_interface& p);
         std::shared_ptr<lazy<rs2_extrinsics>> fetch_edge(int from, int to);
 
         std::shared_ptr<platform::backend> _backend;
-
+#if WITH_TRACKING
+        std::shared_ptr<tm2_context> _tm2_context;
+#endif
         std::shared_ptr<platform::device_watcher> _device_watcher;
-        std::map<std::string, std::shared_ptr<device_info>> _playback_devices;
+        std::map<std::string, std::weak_ptr<device_info>> _playback_devices;
         std::map<uint64_t, devices_changed_callback_ptr> _devices_changed_callbacks;
-
 
         devices_changed_callback_ptr _devices_changed_callback;
         std::map<int, std::weak_ptr<const stream_interface>> _streams;
@@ -174,4 +187,6 @@ namespace librealsense
     platform::uvc_device_info get_mi(const std::vector<platform::uvc_device_info>& devices, uint32_t mi);
     std::vector<platform::uvc_device_info> filter_by_mi(const std::vector<platform::uvc_device_info>& devices, uint32_t mi);
 
+    std::vector<platform::usb_device_info> filter_by_product(const std::vector<platform::usb_device_info>& devices, const std::set<uint16_t>& pid_list);
+    void trim_device_list(std::vector<platform::usb_device_info>& devices, const std::vector<platform::usb_device_info>& chosen);
 }

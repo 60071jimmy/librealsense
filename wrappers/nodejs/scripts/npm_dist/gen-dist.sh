@@ -7,31 +7,33 @@
 #Usage: gen-dist.sh xxxx.tar.gz
 
 WORKDIR=`mktemp -d`
-RAWMODULEDIR="node-librealsense"
+RAWMODULEDIR="node-librealsense/"
 MODULEDIR="$WORKDIR/$RAWMODULEDIR"
 RSDIR="$MODULEDIR/librealsense"
-TARFILENAME="$WORKDIR/$1"
 
-mkdir -p $RSDIR
+mkdir -p $RSDIR/wrappers
 rsync -a ../.. $RSDIR --exclude wrappers --exclude doc --exclude unit-tests --exclude build --exclude .git
 rsync -a . $MODULEDIR --exclude build --exclude dist --exclude node_modules
 
+cp -f ../CMakeLists.txt $RSDIR/wrappers/
 cp -f scripts/npm_dist/binding.gyp $MODULEDIR
 cp -f scripts/npm_dist/package.json $MODULEDIR
 cp -f scripts/npm_dist/README.md $MODULEDIR
+git rev-parse --verify HEAD > $RSDIR/commit
 
 pushd . > /dev/null
 cd $WORKDIR
-tar -czf $1 $RAWMODULEDIR
+FILENAME=`npm pack $RAWMODULEDIR`
+TARFILENAME="$WORKDIR/$FILENAME"
 
 popd > /dev/null
 mkdir -p dist
 cp -f $TARFILENAME ./dist/
 rm -rf $WORKDIR
 
+echo "Generated ./dist/$FILENAME"
 # SHOW INFO & DIR
-if [ "$RS_SHOW_DIST_PACKAGE" -eq 1 ]
+if [ "$RS_SHOW_DIST_PACKAGE" == "1" ];
 then
-	echo "Generated ./dist/$1"
 	gnome-open ./dist
 fi

@@ -2,9 +2,10 @@
 // Copyright(c) 2015 Intel Corporation. All Rights Reserved.
 
 #include <librealsense2/rs.hpp>
-
+#include "source.h"
+#include "core/processing.h"
+#include "proc/synthetic-stream.h"
 #include "device_hub.h"
-
 
 namespace librealsense
 {
@@ -15,31 +16,38 @@ namespace librealsense
         std::vector<std::shared_ptr<device_info>> result;
         for (auto dev : devices)
         {
+            bool filtered = false;
             auto data = dev->get_device_data();
-            for (auto uvc : data.uvc_devices)
+            for (const auto& uvc : data.uvc_devices)
             {
                 if (uvc.vid == vid || vid == 0)
                 {
                     result.push_back(dev);
+                    filtered = true;
                     break;
                 }
             }
+
+            // TODO: enable T265 filter by VID:PID via tm2_device_info
+            if ((!filtered) && data.tm2_devices.size())
+                result.push_back(dev);
         }
         return result;
     }
 
-    device_hub::device_hub(std::shared_ptr<librealsense::context> ctx, int vid,
+    device_hub::device_hub(std::shared_ptr<librealsense::context> ctx, int mask, int vid,
                            bool register_device_notifications)
         : _ctx(ctx), _vid(vid),
+          _device_changes_callback_id(0),
           _register_device_notifications(register_device_notifications)
     {
-        _device_list = filter_by_vid(_ctx->query_devices(), _vid);
+        _device_list = filter_by_vid(_ctx->query_devices(mask), _vid);
 
-        auto cb = new hub_devices_changed_callback([&](rs2::event_information& info)
+        auto cb = new hub_devices_changed_callback([&,mask](rs2::event_information&)
                    {
                         std::unique_lock<std::mutex> lock(_mutex);
 
-                        _device_list = filter_by_vid(_ctx->query_devices(), _vid);
+                        _device_list = filter_by_vid(_ctx->query_devices(mask), _vid);
 
                         // Current device will point to the first available device
                         _camera_index = 0;
@@ -49,7 +57,15 @@ namespace librealsense
                         }
                     });
 
-        _ctx->set_devices_changed_callback({cb,  [](rs2_devices_changed_callback* p) { p->release(); }});
+        _device_changes_callback_id = _ctx->register_internal_device_callback({ cb, [](rs2_devices_changed_callback* p) { p->release(); } });
+    }
+
+    device_hub::~device_hub()
+    {
+        if (_device_changes_callback_id)
+            _ctx->unregister_internal_device_callback(_device_changes_callback_id);
+
+        _ctx->stop();
     }
 
     std::shared_ptr<device_interface> device_hub::create_device(const std::string& serial, bool cycle_devices)
@@ -79,7 +95,7 @@ namespace librealsense
 
         // Advance the internal selection when appropriate
         if (res && cycle_devices)
-            _camera_index = ++_camera_index % _device_list.size();
+            _camera_index = (1+_camera_index) % _device_list.size();
 
         return res;
     }
@@ -96,7 +112,7 @@ namespace librealsense
         std::shared_ptr<device_interface> res = nullptr;
 
         // check if there is at least one device connected
-        _device_list = filter_by_vid(_ctx->query_devices(), _vid);
+        _device_list = filter_by_vid(_ctx->query_devices(RS2_PRODUCT_LINE_ANY), _vid);
         if (_device_list.size() > 0)
         {
             res = create_device(serial, loop_through_devices);
@@ -126,6 +142,11 @@ namespace librealsense
     {
         std::unique_lock<std::mutex> lock(_mutex);
         return dev.is_valid();
+    }
+
+    std::shared_ptr<librealsense::context> device_hub::get_context()
+    {
+        return _ctx;
     }
 }
 

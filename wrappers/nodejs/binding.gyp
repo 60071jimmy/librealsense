@@ -1,10 +1,9 @@
 {
   'variables': {
+    'configuration%': '${BUILDTYPE}',
     'build_arch': '<!(node -p "process.arch")',
-    'variables': {
-      'vs_configuration%': "Debug",
-    },
-    'win_realsense_dir': '<(module_root_dir)/../../build/<(vs_configuration)',
+    'vs_configuration%': "Debug",
+    'win_realsense_dir': '<(module_root_dir)/../../build',
   },
   "targets": [
     {
@@ -48,13 +47,34 @@
                 'SuppressStartupBanner': 'true',
               }
             },
-            "libraries": [
-              "<(win_realsense_dir)/realsense2.lib",
-            ],
+            "conditions": [
+            	[ 'vs_configuration=="Debug"', {
+            		"libraries": [ "<(win_realsense_dir)/Debug/realsense2d.lib" ]
+            	}
+            	],
+            	[ 'vs_configuration=="Release"', {
+            		"libraries": [ "<(win_realsense_dir)/Release/realsense2.lib" ]
+            	}
+            	],
+            ]
           }
         ],
-        [
-          "OS!=\"win\"",
+       ['OS=="mac"',
+          {
+            "libraries": [
+              '<(module_root_dir)/../../build/<(configuration)/librealsense2.dylib',
+              # Write the below RPATH into the generated addon
+              '-Wl,-rpath,@loader_path/../../../../build/<(configuration)',
+            ],
+            'xcode_settings': {
+              'GCC_ENABLE_CPP_EXCEPTIONS': 'YES',
+              'CLANG_CXX_LIBRARY': 'libc++',
+              'MACOS_DEPLOYMENT_TARGET': '10.12',
+              'CLANG_CXX_LANGUAGE_STANDARD': 'c++14'
+            }
+          }
+        ],
+        ['OS=="linux"',
           {
             "libraries": [
               "-lrealsense2"
@@ -66,7 +86,7 @@
               # rpatch for build debian package
               '-Wl,-rpath,\$$ORIGIN/../../../../obj-x86_64-linux-gnu',
               '-L<(module_root_dir)/../../obj-x86_64-linux-gnu'
-            ],
+           ],
             "cflags+": [
               "-std=c++11"
             ],
@@ -90,7 +110,16 @@
             [
               {
                 'destination': '<(module_root_dir)/build/Release',
-                'files': ['<(win_realsense_dir)/realsense2.dll']
+                "conditions": [
+            	[ 'vs_configuration=="Debug"', {
+            		'files': ['<(win_realsense_dir)/Debug/realsense2d.dll']
+            	}
+            	],
+            	[ 'vs_configuration=="Release"', {
+            		'files': ['<(win_realsense_dir)/Release/realsense2.dll']
+            	}
+            	],
+            ]
               }
             ]
         }]

@@ -2041,6 +2041,8 @@ void ImGui::NewFrame()
 {
     ImGuiContext& g = *GImGui;
 
+    if (g.IO.DeltaTime < 0.0f) g.IO.DeltaTime = 0.0f;
+
     // Check user data
     IM_ASSERT(g.IO.DeltaTime >= 0.0f);               // Need a positive DeltaTime (zero is tolerated but will cause some timing issues)
     IM_ASSERT(g.IO.DisplaySize.x >= 0.0f && g.IO.DisplaySize.y >= 0.0f);
@@ -5213,6 +5215,11 @@ void ImGui::TextV(const char* fmt, va_list args)
     TextUnformatted(g.TempBuffer, text_end);
 }
 
+void ImGui::Icon(const char* icon)
+{
+    ImGui::Text("%s", icon);
+}
+
 void ImGui::Text(const char* fmt, ...)
 {
     va_list args;
@@ -5616,11 +5623,11 @@ bool ImGui::CloseButton(ImGuiID id, const ImVec2& pos, float radius)
     window->DrawList->AddCircleFilled(center, ImMax(2.0f, radius), col, 12);
 
     const float cross_extent = (radius * 0.7071f) - 1.0f;
-    if (hovered)
-    {
-        window->DrawList->AddLine(center + ImVec2(+cross_extent,+cross_extent), center + ImVec2(-cross_extent,-cross_extent), GetColorU32(ImGuiCol_Text));
-        window->DrawList->AddLine(center + ImVec2(+cross_extent,-cross_extent), center + ImVec2(-cross_extent,+cross_extent), GetColorU32(ImGuiCol_Text));
-    }
+  //  if (hovered)
+  //  {
+    window->DrawList->AddLine(center + ImVec2(+cross_extent,+cross_extent), center + ImVec2(-cross_extent,-cross_extent), GetColorU32(ImGuiCol_Text));
+    window->DrawList->AddLine(center + ImVec2(+cross_extent,-cross_extent), center + ImVec2(-cross_extent,+cross_extent), GetColorU32(ImGuiCol_Text));
+//    }
 
     return pressed;
 }
@@ -6513,10 +6520,10 @@ bool ImGui::SliderBehavior(const ImRect& frame_bb, ImGuiID id, float* v, float v
                 bb.Min.y -= 0.5;
                 bb.Max.y += 0.5;
             }
-            float grab_padding = 2.0f;
+            float grab_paddingl = 2.0f;
             //Horizontal fills from left to right
             fill_br.Min = bb.Min;
-            fill_br.Max = ImVec2(ImLerp(bb.Min.x, bb.Max.x - grab_padding, *v / 100), bb.Max.y);
+            fill_br.Max = ImVec2(ImLerp(bb.Min.x, bb.Max.x - grab_paddingl, *v / 100), bb.Max.y);
             graber_size = { grab_bb.Max.x - (width / 2.0f) , grab_bb.Max.y - (height / 2.0f) };
             radius = height / 2.5f;
         }
@@ -6529,7 +6536,7 @@ bool ImGui::SliderBehavior(const ImRect& frame_bb, ImGuiID id, float* v, float v
                 bb.Min.x -= 0.5;
                 bb.Max.x += 0.5;
             }
-            float grab_padding = 2.0f;
+            float grab_paddingl = 2.0f;
             //Vertical fills from down upwards
             fill_br.Min = bb.Min;
             fill_br.Min.y = grab_bb.Min.y;
@@ -8409,14 +8416,14 @@ static bool Items_SingleStringGetter(void* data, int idx, const char** out_text)
 }
 
 // Combo box helper allowing to pass an array of strings.
-bool ImGui::Combo(const char* label, int* current_item, const char** items, int items_count, int height_in_items)
+bool ImGui::Combo(const char* label, int* current_item, const char** items, int items_count, int height_in_items, bool show_arrow_down)
 {
     const bool value_changed = Combo(label, current_item, Items_ArrayGetter, (void*)items, items_count, height_in_items);
     return value_changed;
 }
 
 // Combo box helper allowing to pass all items in a single string.
-bool ImGui::Combo(const char* label, int* current_item, const char* items_separated_by_zeros, int height_in_items)
+bool ImGui::Combo(const char* label, int* current_item, const char* items_separated_by_zeros, int height_in_items, bool show_arrow_down)
 {
     int items_count = 0;
     const char* p = items_separated_by_zeros;       // FIXME-OPT: Avoid computing this, or at least only when combo is open
@@ -8425,12 +8432,12 @@ bool ImGui::Combo(const char* label, int* current_item, const char* items_separa
         p += strlen(p) + 1;
         items_count++;
     }
-    bool value_changed = Combo(label, current_item, Items_SingleStringGetter, (void*)items_separated_by_zeros, items_count, height_in_items);
+    bool value_changed = Combo(label, current_item, Items_SingleStringGetter, (void*)items_separated_by_zeros, items_count, height_in_items, show_arrow_down);
     return value_changed;
 }
 
 // Combo box function.
-bool ImGui::Combo(const char* label, int* current_item, bool (*items_getter)(void*, int, const char**), void* data, int items_count, int height_in_items)
+bool ImGui::Combo(const char* label, int* current_item, bool (*items_getter)(void*, int, const char**), void* data, int items_count, int height_in_items, bool show_arrow_down)
 {
     ImGuiWindow* window = GetCurrentWindow();
     if (window->SkipItems)
@@ -8448,16 +8455,18 @@ bool ImGui::Combo(const char* label, int* current_item, bool (*items_getter)(voi
     if (!ItemAdd(total_bb, &id))
         return false;
 
-    const float arrow_size = (g.FontSize + style.FramePadding.x * 2.0f);
+    const float arrow_size = show_arrow_down ? (g.FontSize + style.FramePadding.x * 2.0f) : 0;
     const bool hovered = IsHovered(frame_bb, id);
     bool popup_open = IsPopupOpen(id);
     bool popup_opened_now = false;
 
     const ImRect value_bb(frame_bb.Min, frame_bb.Max - ImVec2(arrow_size, 0.0f));
-    RenderFrame(frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
-    RenderFrame(ImVec2(frame_bb.Max.x-arrow_size, frame_bb.Min.y), frame_bb.Max, GetColorU32(popup_open || hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button), true, style.FrameRounding); // FIXME-ROUNDING
-    RenderCollapseTriangle(ImVec2(frame_bb.Max.x-arrow_size, frame_bb.Min.y) + style.FramePadding, true);
-
+    if (show_arrow_down)
+    {
+        RenderFrame(frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+        RenderFrame(ImVec2(frame_bb.Max.x - arrow_size, frame_bb.Min.y), frame_bb.Max, GetColorU32(popup_open || hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button), true, style.FrameRounding); // FIXME-ROUNDING
+        RenderCollapseTriangle(ImVec2(frame_bb.Max.x - arrow_size, frame_bb.Min.y) + style.FramePadding, true);
+    }
     if (*current_item >= 0 && *current_item < items_count)
     {
         const char* item_text;

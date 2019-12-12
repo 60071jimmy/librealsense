@@ -109,6 +109,7 @@ namespace librealsense
         STDepthTableControl            depth_table;
         STAEControl                    ae;
         STCensusRadius                 census;
+        STAFactor                      amplitude_factor;
         laser_state_control            laser_state;
         laser_power_control            laser_power;
         exposure_control               depth_exposure;
@@ -130,6 +131,11 @@ namespace librealsense
         power_line_frequency_control   color_power_line_frequency;
     };
 
+    void default_400(preset& p);
+    void default_405(preset& p);
+    void default_410(preset& p);
+    void default_420(preset& p);
+    void default_430(preset& p);
     void high_res_high_accuracy(preset& p);
     void high_res_high_density(preset& p);
     void high_res_mid_density(preset& p);
@@ -139,6 +145,7 @@ namespace librealsense
     void mid_res_high_accuracy(preset& p);
     void mid_res_high_density(preset& p);
     void mid_res_mid_density(preset& p);
-    void short_range(preset& p);
     void hand_gesture(preset& p);
+    void d415_remove_ir(preset& p);
+    void d460_remove_ir(preset& p);
 }

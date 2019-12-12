@@ -5,7 +5,8 @@
 This sample demonstrates how to generate and visualize textured 3D pointcloud.
 
 ## Expected Output
-The application should open a window with a pointcloud. Using your mouse, you should be able to interact with the pointcloud, rotating, zooming, and panning.
+The application should open a window with a pointcloud. Using your mouse, you should be able to interact with the pointcloud  rotating and zooming using the mouse.
+
 ![expected output](https://raw.githubusercontent.com/wiki/IntelRealSense/librealsense/res/point-cloud-expected.png)
 
 ## Code Overview
@@ -20,7 +21,7 @@ Next, we prepared a [very short helper library](../example.hpp) encapsulating ba
 #include "example.hpp"          // Include short list of convenience functions for rendering
 ```
 
-We also include the STL `<algorthm>` header for `std::min` and `std::max`.
+We also include the STL `<algorithm>` header for `std::min` and `std::max`.
 
 Next, we define a `state` struct and two helper functions. `state` and `register_glfw_callbacks` handle the pointcloud's rotation in the application, and `draw_pointcloud` makes all the OpenGL calls necessary to display the pointcloud.
 ```cpp
@@ -71,19 +72,19 @@ auto data = pipe.wait_for_frames(); // Wait for next set of frames from the came
 Using helper functions on the `frameset` object we check for new depth and color frames. We pass it to the `pointcloud` object to use as the texture, and also give it to OpenGL with the help of the `texture` class. We generate a new pointcloud.
 ```cpp
 // Wait for the next set of frames from the camera
-	auto frames = pipe.wait_for_frames();
-	auto depth = frames.get_depth_frame();
+auto frames = pipe.wait_for_frames();
+auto depth = frames.get_depth_frame();
 
-    // Generate the pointcloud and texture mappings
-    points = pc.calculate(depth);
+// Generate the pointcloud and texture mappings
+points = pc.calculate(depth);
 
-	auto color = frames.get_color_frame();
+auto color = frames.get_color_frame();
 
-    // Tell pointcloud object to map to this color frame
-    pc.map_to(color);
+// Tell pointcloud object to map to this color frame
+pc.map_to(color);
 
-    // Upload the color frame to OpenGL
-    app_state.tex.upload(color);
+// Upload the color frame to OpenGL
+app_state.tex.upload(color);
 
 ```
 

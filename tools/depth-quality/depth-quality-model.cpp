@@ -1,7 +1,11 @@
+// License: Apache 2.0. See LICENSE file in root directory.
+// Copyright(c) 2019 Intel Corporation. All Rights Reserved.
 #include <iomanip>
 #include "depth-quality-model.h"
 #include <librealsense2/rs_advanced_mode.hpp>
 #include "model-views.h"
+#include "viewer.h"
+#include "os.h"
 
 namespace rs2
 {
@@ -12,42 +16,80 @@ namespace rs2
               _roi_located(std::chrono::seconds(4)),
               _too_close(std::chrono::seconds(4)),
               _too_far(std::chrono::seconds(4)),
-              _sku_right(std::chrono::seconds(1)),
-              _sku_left(std::chrono::seconds(1)),
-              _sku_up(std::chrono::seconds(1)),
-              _sku_down(std::chrono::seconds(1)),
+              _skew_right(std::chrono::seconds(1)),
+              _skew_left(std::chrono::seconds(1)),
+              _skew_up(std::chrono::seconds(1)),
+              _skew_down(std::chrono::seconds(1)),
               _angle_alert(std::chrono::seconds(4)),
-              _min_dist(300.f), _max_dist(2000.f), _max_angle(10.f)
+              _min_dist(300.f), _max_dist(2000.f), _max_angle(10.f),
+              _metrics_model(_viewer_model)
         {
             _viewer_model.is_3d_view = true;
             _viewer_model.allow_3d_source_change = false;
             _viewer_model.allow_stream_close = false;
             _viewer_model.draw_plane = true;
+            _viewer_model.synchronization_enable = false;
+            _viewer_model.support_non_syncronized_mode = false; //pipeline outputs only syncronized frameset
         }
 
         bool tool_model::start(ux_window& window)
         {
             bool valid_config = false;
             std::vector<rs2::config> cfgs;
+            rs2::pipeline_profile active_profile;
 
-            rs2::config cfg;
-            // Preferred configuration Depth + Synthetic Color
-            cfg.enable_stream(RS2_STREAM_DEPTH, -1, 0, 0, RS2_FORMAT_Z16, 30);
-            cfg.enable_stream(RS2_STREAM_INFRARED, -1, 0, 0, RS2_FORMAT_RGB8, 30);
-            cfgs.push_back(cfg);
+            // Adjust settings according to USB type
+            bool usb3_device = true;
+            auto devices = _ctx.query_devices();
+            if (devices.size())
+            {
+                auto dev = devices[0];
+                bool usb3_device = true;
+                if (dev.supports(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR))
+                {
+                    std::string usb_type = dev.get_info(RS2_CAMERA_INFO_USB_TYPE_DESCRIPTOR);
+                    usb3_device = !(std::string::npos != usb_type.find("2."));
+                }
+            }
+            else
+                return valid_config;
 
+            int requested_fps = usb3_device ? 30 : 15;
+
+            {
+                rs2::config cfg_default;
+                // Preferred configuration Depth + Synthetic Color
+                cfg_default.enable_stream(RS2_STREAM_DEPTH, -1, 0, 0, RS2_FORMAT_Z16, requested_fps);
+                cfg_default.enable_stream(RS2_STREAM_INFRARED, -1, 0, 0, RS2_FORMAT_RGB8, requested_fps);
+                cfgs.emplace_back(cfg_default);
+            }
             // Use Infrared luminocity as a secondary video in case synthetic chroma is not supported
-            cfg.disable_all_streams();
-            cfg.enable_stream(RS2_STREAM_DEPTH, 0, 0, 0, RS2_FORMAT_Z16, 30);
-            cfg.enable_stream(RS2_STREAM_INFRARED, 1, 0, 0, RS2_FORMAT_Y8, 30);
-            cfgs.push_back(cfg);
+            {
+                rs2::config cfg_alt;
+                cfg_alt.enable_stream(RS2_STREAM_DEPTH, -1, 0, 0, RS2_FORMAT_Z16, requested_fps);
+                cfg_alt.enable_stream(RS2_STREAM_INFRARED, -1, 0, 0, RS2_FORMAT_Y8, requested_fps);
+                cfgs.emplace_back(cfg_alt);
+            }
 
             for (auto& cfg : cfgs)
             {
-                if (valid_config = cfg.can_resolve(_pipe))
+                if ((valid_config = cfg.can_resolve(_pipe)))
                 {
-                    _pipe.start(cfg);
-                    break;
+                    try {
+                        active_profile = _pipe.start(cfg);
+                        valid_config = active_profile;
+                        break;
+                    }
+                    catch (...)
+                    {
+                        _pipe.stop();
+                        valid_config = false;
+                        if (!_device_in_use)
+                        {
+                            window.add_on_load_message("Device is not functional or busy!");
+                            _device_in_use = true;
+                        }
+                    }
                 }
             }
 
@@ -120,7 +162,12 @@ namespace rs2
 
         bool tool_model::draw_instructions(ux_window& win, const rect& viewer_rect, bool& distance, bool& orientation)
         {
-            _roi_located.add_value(is_valid(_metrics_model.get_plane()));
+            if (_viewer_model.paused)
+                return false;
+
+            auto plane_fit_found = is_valid(_metrics_model.get_plane());
+            _metrics_model.set_plane_fit(plane_fit_found);
+            _roi_located.add_value(plane_fit_found);
             if (!_roi_located.eval())
             {
                 draw_notification(win, viewer_rect, 450,
@@ -135,16 +182,16 @@ namespace rs2
                 orientation = true;
             }
 
-            _sku_right.add_value(orientation && _metrics_model.get_last_metrics().angle_x > 0.f
+            _skew_right.add_value(orientation && _metrics_model.get_last_metrics().angle_x > 0.f
                 && fabs(_metrics_model.get_last_metrics().angle_x) > fabs(_metrics_model.get_last_metrics().angle_y));
 
-            _sku_left.add_value(orientation && _metrics_model.get_last_metrics().angle_x < 0.f
+            _skew_left.add_value(orientation && _metrics_model.get_last_metrics().angle_x < 0.f
                 && fabs(_metrics_model.get_last_metrics().angle_x) > fabs(_metrics_model.get_last_metrics().angle_y));
 
-            _sku_up.add_value(orientation && _metrics_model.get_last_metrics().angle_y < 0.f
+            _skew_up.add_value(orientation && _metrics_model.get_last_metrics().angle_y < 0.f
                 && fabs(_metrics_model.get_last_metrics().angle_x) <= fabs(_metrics_model.get_last_metrics().angle_y));
 
-            _sku_down.add_value(orientation && _metrics_model.get_last_metrics().angle_y > 0.f
+            _skew_down.add_value(orientation && _metrics_model.get_last_metrics().angle_y > 0.f
                 && fabs(_metrics_model.get_last_metrics().angle_x) <= fabs(_metrics_model.get_last_metrics().angle_y));
 
             _too_close.add_value(_metrics_model.get_last_metrics().distance < _min_dist);
@@ -153,7 +200,7 @@ namespace rs2
             constexpr const char* orientation_instruction = "                         Recommended angle: < 3 degrees"; // "             Use the orientation gimbal to align the camera";
             constexpr const char* distance_instruction    = "          Recommended distance: 0.3m-2m from the target"; // "             Use the distance locator to position the camera";
 
-            if (_sku_right.eval())
+            if (_skew_right.eval())
             {
                 draw_notification(win, viewer_rect, 400,
                     u8"\n          \uf061  Rotate the camera slightly Right",
@@ -161,7 +208,7 @@ namespace rs2
                 return false;
             }
 
-            if (_sku_left.eval())
+            if (_skew_left.eval())
             {
                 draw_notification(win, viewer_rect, 400,
                     u8"\n           \uf060  Rotate the camera slightly Left",
@@ -169,7 +216,7 @@ namespace rs2
                 return false;
             }
 
-            if (_sku_up.eval())
+            if (_skew_up.eval())
             {
                 draw_notification(win, viewer_rect, 400,
                     u8"\n            \uf062  Rotate the camera slightly Up",
@@ -177,7 +224,7 @@ namespace rs2
                 return false;
             }
 
-            if (_sku_down.eval())
+            if (_skew_down.eval())
             {
                 draw_notification(win, viewer_rect, 400,
                     u8"\n          \uf063  Rotate the camera slightly Down",
@@ -273,20 +320,20 @@ namespace rs2
             for (int i = 2; i < 7; i += 1)
             {
                 auto t = (animation_clock.elapsed_ms() / 500) * M_PI - i * (M_PI / 5);
-                auto alpha = (1.f + sin(t)) / 2.f;
+                float alpha = (1.f + float(sin(t))) / 2.f;
 
                 auto c = blend(grey, (1.f - float(i)/7.f)*fade_factor);
                 if (orientation_guide) c = blend(light_blue, alpha);
 
                 ImGui::GetWindowDrawList()->AddCircle(
-                { pos1.x + 41 - 2 * i * prev_x, pos1.y + 40 - 2 * i * prev_y }, 40 - i*i,
+                { pos1.x + 41 - 2 * i * prev_x, pos1.y + 40 - 2 * i * prev_y }, 40.f - i*i,
                     ImColor(c), 64);
             }
 
             if (angle < 50)
             {
                 ImGui::GetWindowDrawList()->AddCircleFilled(
-                { pos1.x + 41 + 70 * prev_x, pos1.y + 40 + 70 * prev_y }, 10,
+                { pos1.x + 41 + 70 * prev_x, pos1.y + 40 + 70 * prev_y }, 10.f,
                     ImColor(blend(grey, orientation_guide ? 1.f : fade_factor)), 64);
             }
 
@@ -310,7 +357,7 @@ namespace rs2
                     auto min_y = pos1.y + 10;
                     auto max_y = window_h + window_y;
                     int bar_spacing = 15;
-                    int parts = (max_y - min_y) / bar_spacing;
+                    int parts = int(max_y - min_y) / bar_spacing;
 
                     ImGui::GetWindowDrawList()->AddRect(
                     { pos1.x + 1, pos1.y },
@@ -343,7 +390,7 @@ namespace rs2
                             for (int j = -2; j < 2; j++)
                             {
                                 auto yc = yellow;
-                                auto factor = (1 - fabs(j) / 3);
+                                auto factor = (1 - abs(j) / 3.f);
                                 yc = blend(yc, factor*factor);
                                 if (!distance_guide) yc = blend(yc, fade_factor);
                                 ImGui::GetWindowDrawList()->AddRectFilled(
@@ -356,7 +403,7 @@ namespace rs2
                                 for (int j = 1; j < 5; j++)
                                 {
                                     auto t = (animation_clock.elapsed_ms() / 500) * M_PI - j * (M_PI / 5);
-                                    auto alpha = (1.f + sin(t)) / 2.f;
+                                    auto alpha = (1 + float(sin(t))) / 2.f;
 
                                     ImGui::SetCursorPos({ pos.x + 57, pos.y + bar_spacing * (i - j) + 14 });
                                     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -371,7 +418,7 @@ namespace rs2
                                 for (int j = 1; j < 5; j++)
                                 {
                                     auto t = (animation_clock.elapsed_ms() / 500) * M_PI - j * (M_PI / 5);
-                                    auto alpha = (1.f + sin(t)) / 2.f;
+                                    auto alpha = (1.f + float(sin(t))) / 2.f;
 
                                     ImGui::SetCursorPos({ pos.x + 57, pos.y + bar_spacing * (i + j) + 14 });
                                     ImGui::PushStyleColor(ImGuiCol_Text,
@@ -394,8 +441,6 @@ namespace rs2
 
         void tool_model::render(ux_window& win)
         {
-            win.begin_viewport();
-
             rect viewer_rect = { _viewer_model.panel_width,
                 _viewer_model.panel_y, win.width() -
                 _viewer_model.panel_width,
@@ -403,18 +448,17 @@ namespace rs2
 
             if (_first_frame)
             {
-                _viewer_model.update_3d_camera(viewer_rect, win.get_mouse(), true);
+                _viewer_model.update_3d_camera(win, viewer_rect, true);
                 _first_frame = false;
             }
 
-            _viewer_model.show_top_bar(win, viewer_rect);
+            device_models_list list;
+            _viewer_model.show_top_bar(win, viewer_rect, list);
             _viewer_model.roi_rect = _metrics_model.get_plane();
-            _viewer_model.draw_viewport(viewer_rect, win, 1, _error_message);
 
             bool distance_guide = false;
             bool orientation_guide = false;
             bool found = draw_instructions(win, viewer_rect, distance_guide, orientation_guide);
-            //draw_guides(win, viewer_rect, distance_guide, orientation_guide);
 
             ImGui::PushStyleColor(ImGuiCol_WindowBg, button_color);
             ImGui::SetNextWindowPos({ 0, 0 });
@@ -438,15 +482,56 @@ namespace rs2
             if (_device_model.get())
             {
                 device_model* device_to_remove = nullptr;
-                std::map<subdevice_model*, float> model_to_y;
-                std::map<subdevice_model*, float> model_to_abs_y;
+                std::vector<std::function<void()>> draw_later;
                 auto windows_width = ImGui::GetContentRegionMax().x;
-
+                auto json_loaded = false;
                 _device_model->draw_controls(_viewer_model.panel_width, _viewer_model.panel_y,
-                    win.get_font(), win.get_large_font(), win.get_mouse(),
+                    win,
                     _error_message, device_to_remove, _viewer_model, windows_width,
-                    _update_readonly_options_timer,
-                    model_to_y, model_to_abs_y);
+                    draw_later, true,
+                    [&](std::function<void()>func)
+                    {
+                        auto profile =_pipe.get_active_profile();
+                        _pipe.stop();
+                        func();
+
+                        auto streams = profile.get_streams();
+                        config cfg;
+
+                        for (auto&& s : streams)
+                        {
+                            cfg.enable_stream(s.stream_type(), s.stream_index(), s.format(), s.fps());
+                        }
+                        _pipe.start(cfg);
+
+                        json_loaded = true;
+                    },
+                    false);
+
+                if (json_loaded)
+                {
+                    update_configuration();
+                }
+                ImGui::SetContentRegionWidth(windows_width);
+                auto pos = ImGui::GetCursorScreenPos();
+
+                for (auto&& lambda : draw_later)
+                {
+                    try
+                    {
+                        lambda();
+                    }
+                    catch (const error& e)
+                    {
+                        _error_message = error_to_string(e);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        _error_message = e.what();
+                    }
+                }
+                // Restore the cursor position after invoking lambdas
+                ImGui::SetCursorScreenPos(pos);
 
                 if (_depth_sensor_model.get())
                 {
@@ -475,20 +560,28 @@ namespace rs2
                                 _pipe.stop();
 
                                 rs2::config cfg;
-
+                                // We have a single resolution control that obides both streams
                                 cfg.enable_stream(primary.stream_type(), primary.stream_index(),
                                     primary.width(), primary.height(), primary.format(), primary.fps());
                                 cfg.enable_stream(secondary.stream_type(), secondary.stream_index(),
                                     primary.width(), primary.height(), secondary.format(), primary.fps());
 
-                                // Wait till a valid device is found and responsive
+                                // The secondary stream may use its previous resolution when appropriate
+                                if (!cfg.can_resolve(_pipe))
+                                {
+                                    cfg.disable_stream(secondary.stream_type());
+                                    cfg.enable_stream(secondary.stream_type(), secondary.stream_index(),
+                                        secondary.width(), secondary.height(), secondary.format(), primary.fps());
+                                }
+
+                                // Wait till a valid device is registered and responsive
                                 bool success = false;
                                 do
                                 {
                                     try // Retries are needed to cope with HW stability issues
                                     {
-                                        _pipe.start(cfg);
-                                        success = true;
+                                        auto profile = _pipe.start(cfg);
+                                        success = profile;
                                     }
                                     catch (...)
                                     {
@@ -532,10 +625,21 @@ namespace rs2
                         ImGui::Text("Distance:");
                         if (ImGui::IsItemHovered())
                         {
-                            ImGui::SetTooltip("Estimated distance to the wall in mm");
+                            ImGui::SetTooltip("Estimated distance to an average within the ROI of the target (wall) in mm");
                         }
                         ImGui::SameLine(); ImGui::SetCursorPosX(col1);
-                        ImGui::Text("%.2f mm", _metrics_model.get_last_metrics().distance);
+
+                        static float prev_metric_distance = 0;
+                        if (_viewer_model.paused)
+                        {
+                            ImGui::Text("%.2f mm", prev_metric_distance);
+                        }
+                        else
+                        {
+                            auto curr_metric_distance = _metrics_model.get_last_metrics().distance;
+                            ImGui::Text("%.2f mm", curr_metric_distance);
+                            prev_metric_distance = curr_metric_distance;
+                        }
 
                         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5);
 
@@ -565,7 +669,7 @@ namespace rs2
                         }
                         else
                         {
-                            _ground_truth = _metrics_model.get_last_metrics().distance;
+                            _ground_truth = int(_metrics_model.get_last_metrics().distance);
                             ImGui::Dummy({ 1,1 });
                         }
                         ImGui::PopStyleColor();
@@ -578,7 +682,17 @@ namespace rs2
                             ImGui::SetTooltip("Estimated angle to the wall in degrees");
                         }
                         ImGui::SameLine(); ImGui::SetCursorPosX(col1);
-                        ImGui::Text("%.2f deg", _metrics_model.get_last_metrics().angle);
+                        static float prev_metric_angle = 0;
+                        if (_viewer_model.paused)
+                        {
+                            ImGui::Text("%.2f mm", prev_metric_angle);
+                        }
+                        else
+                        {
+                            auto curr_metric_angle = _metrics_model.get_last_metrics().angle;
+                            ImGui::Text("%.2f mm", curr_metric_angle);
+                            prev_metric_angle = curr_metric_angle;
+                        }
 
                         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5);
                         ImGui::TreePop();
@@ -590,7 +704,7 @@ namespace rs2
                     ImGui::PopStyleVar();
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemInnerSpacing, { 0, 0 });
 
-                    if (found && ImGui::TreeNodeEx("Metrics", ImGuiTreeNodeFlags_DefaultOpen))
+                    if (ImGui::TreeNodeEx("Metrics", ImGuiTreeNodeFlags_DefaultOpen))
                     {
                         ImGui::PopStyleVar();
                         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, { 2, 2 });
@@ -599,14 +713,26 @@ namespace rs2
 
                         ImGui::PushStyleColor(ImGuiCol_Text, light_grey);
                         ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, white);
-                        if (ImGui::Button(u8"\uf0c7 Save Report", { 140, 25 }))
+                        if (_metrics_model.is_recording())
                         {
-                            snapshot_metrics();
+                            if (ImGui::Button(u8"\uf0c7 Stop_record", { 140, 25 }))
+                            {
+                                _metrics_model.stop_record(_device_model.get());
+                            }
                         }
-                        if (ImGui::IsItemHovered())
+                        else
                         {
-                            ImGui::SetTooltip("Save Metrics snapshot. This will create:\nPNG image with the depth frame\nPLY 3D model with the point cloud\nJSON file with camera settings you can load later\nand a CSV with metrics recent values");
+                            if (ImGui::Button(u8"\uf0c7 Start_record", { 140, 25 }))
+                            {
+                                _metrics_model.start_record();
+                            }
+
+                            if (ImGui::IsItemHovered())
+                            {
+                                ImGui::SetTooltip("Save Metrics snapshot. This will create:\nPNG image with the depth frame\nPLY 3D model with the point cloud\nJSON file with camera settings you can load later\nand a CSV with metrics recent values");
+                            }
                         }
+
                         ImGui::PopStyleColor(2);
 
                         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 5);
@@ -629,20 +755,14 @@ namespace rs2
                 frameset f;
                 if (_pipe.poll_for_frames(&f))
                 {
-                    for (auto&& frame : f)
-                    {
-                        if (frame.is<depth_frame>() && !_viewer_model.paused)
-                        {
-                            _metrics_model.begin_process_frame(frame);
-                        }
-                        _viewer_model.upload_frame(std::move(frame));
-                    }
+                    _viewer_model.ppf.frames_queue[f.get_profile().unique_id()].enqueue(f);
                 }
+                frame dpt = _viewer_model.handle_ready_frames(viewer_rect, win, 1, _error_message);
+                if (dpt)
+                    _metrics_model.begin_process_frame(dpt);
             }
             catch (...){} // on device disconnect
 
-            _viewer_model.gc_streams();
-            _viewer_model.popup_if_error(win.get_font(), _error_message);
         }
 
         void tool_model::update_configuration()
@@ -660,7 +780,7 @@ namespace rs2
                 for (auto&& s : _device_model->subdevices)
                     s->streaming = false;
                 _viewer_model.gc_streams();
-                _viewer_model.pc.reset();
+                _viewer_model.ppf.reset();
                 _viewer_model.selected_depth_source_uid = -1;
                 _viewer_model.selected_tex_source_uid = -1;
             }
@@ -672,7 +792,8 @@ namespace rs2
             _device_model->show_depth_only = true;
             _device_model->show_stream_selection = false;
             _depth_sensor_model = std::shared_ptr<rs2::subdevice_model>(
-                new subdevice_model(dev, dpt_sensor, _error_message));
+                new subdevice_model(dev, dpt_sensor, _error_message, _viewer_model));
+
             _depth_sensor_model->draw_streams_selector = false;
             _depth_sensor_model->draw_fps_selector = true;
 
@@ -697,6 +818,7 @@ namespace rs2
             }
 
             _metrics_model.reset();
+            _metrics_model.update_device_data(capture_description());
 
             // Restore GUI controls to the selected configuration
             if (save)
@@ -715,12 +837,13 @@ namespace rs2
                 sub->depth_colorizer->set_option(RS2_OPTION_HISTOGRAM_EQUALIZATION_ENABLED, 0.f);
                 sub->depth_colorizer->set_option(RS2_OPTION_MIN_DISTANCE, 0.3f);
                 sub->depth_colorizer->set_option(RS2_OPTION_MAX_DISTANCE, 2.7f);
-                sub->options_invalidated = true;
+                sub->_options_invalidated = true;
 
                 for (auto&& profile : profiles)
                 {
-                    _viewer_model.streams[profile.unique_id()].dev = sub;
+                    _viewer_model.begin_stream(sub, profile);
                     _viewer_model.streams[profile.unique_id()].texture->colorize = sub->depth_colorizer;
+                    _viewer_model.streams[profile.unique_id()].texture->yuy2rgb = sub->yuy2rgb;
 
                     if (profile.stream_type() == RS2_STREAM_DEPTH)
                     {
@@ -728,10 +851,11 @@ namespace rs2
                         _metrics_model.update_stream_attributes(depth_profile.get_intrinsics(),
                             sub->s->as<depth_sensor>().get_depth_scale(), baseline_mm);
 
-                        _metrics_model.update_frame_attributes({ int(depth_profile.width() * (0.5f - 0.5f*_roi_percent)),
+                        _metrics_model.update_roi_attributes({ int(depth_profile.width() * (0.5f - 0.5f*_roi_percent)),
                                                            int(depth_profile.height() * (0.5f - 0.5f*_roi_percent)),
                                                            int(depth_profile.width() * (0.5f + 0.5f*_roi_percent)),
-                                                           int(depth_profile.height() * (0.5f + 0.5f*_roi_percent)) });
+                                                           int(depth_profile.height() * (0.5f + 0.5f*_roi_percent)) },
+                                                            _roi_percent);
                     }
                 }
 
@@ -748,6 +872,7 @@ namespace rs2
             }
             catch(...){}
 
+            _device_in_use = false;
             _first_frame = true;
             win.reset();
         }
@@ -777,99 +902,68 @@ namespace rs2
             return improved > window_size * 0.4;
         }
 
-        void tool_model::snapshot_metrics()
-        {
-            if (auto ret = file_dialog_open(save_file, NULL, NULL, NULL))
-            {
-                std::string filename_base(ret);
-
-                // Save depth/ir images
-                for (auto const &stream : _viewer_model.streams)
-                {
-                    if (auto frame = stream.second.texture->get_last_frame().as<video_frame>())
-                    {
-                        // Use the colorizer to get an rgb image for the depth stream
-                        if (frame.is<rs2::depth_frame>())
-                        {
-                            rs2::colorizer color_map;
-                            frame = color_map(frame);
-                        }
-
-                        std::string stream_desc = rs2_stream_to_string(frame.get_profile().stream_type());
-                        std::string filename = filename_base + "_" + stream_desc + ".png";
-                        save_to_png(filename.data(), frame.get_width(), frame.get_height(), frame.get_bytes_per_pixel(), frame.get_data(), frame.get_width() * frame.get_bytes_per_pixel());
-
-                        _viewer_model.not_model.add_notification({ to_string() << stream_desc << " snapshot was saved to " << filename,
-                            0, RS2_LOG_SEVERITY_INFO,
-                            RS2_NOTIFICATION_CATEGORY_UNKNOWN_ERROR });
-                    }
-                }
-
-                // Export 3d view in PLY format
-                frame ply_texture;
-                if (_viewer_model.selected_tex_source_uid >= 0)
-                {
-                    ply_texture = _viewer_model.streams[_viewer_model.selected_tex_source_uid].texture->get_last_frame();
-                    if (ply_texture)
-                        _viewer_model.pc.update_texture(ply_texture);
-                }
-                export_to_ply(filename_base + "_3d_mesh.ply", _viewer_model.not_model, _viewer_model.pc.get_points(), ply_texture);
-
-                // Save Metrics
-                _metrics_model.serialize_to_csv(filename_base + "_depth_metrics.csv", capture_description());
-
-                // Save camera configuration - supported when camera is in advanced mode only
-                if (_device_model.get())
-                {
-                    if (auto adv = _device_model->dev.as<rs400::advanced_mode>())
-                    {
-                        std::string filename = filename_base + "_configuration.json";
-                        std::ofstream out(filename);
-                        out << adv.serialize_json();
-                        out.close();
-                    }
-                }
-            }
-        }
-
-        metrics_model::metrics_model() :
+        metrics_model::metrics_model(viewer_model& viewer_model) :
             _frame_queue(1),
-            _depth_scale_units(0.f), _active(true)
+            _depth_scale_units(0.f),
+            _stereo_baseline_mm(0.f),
+            _ground_truth_mm(0),
+            _use_gt(false),
+            _plane_fit(false),
+            _roi_percentage(0.4f),
+            _active(true),
+            _recorder(viewer_model)
         {
             _worker_thread = std::thread([this]() {
                 while (_active)
                 {
-                    rs2::frame depth_frame;
-                    if (!_frame_queue.poll_for_frame(&depth_frame))
+                    rs2::frameset frames;
+                    if (!_frame_queue.poll_for_frame(&frames))
                     {
                         std::this_thread::sleep_for(std::chrono::milliseconds(10));
                         continue;
                     }
 
-                    auto stream_type = depth_frame.get_profile().stream_type();
-
-                    if (RS2_STREAM_DEPTH == stream_type)
+                    std::vector<single_metric_data> sample;
+                    for (auto&& f : frames)
                     {
-                        float su = 0, baseline = -1.f;
-                        rs2_intrinsics intrin;
-                        region_of_interest roi;
-                        {
-                            std::lock_guard<std::mutex> lock(_m);
-                            su = _depth_scale_units;
-                            baseline = _stereo_baseline_mm;
-                            intrin = _depth_intrinsic;
-                            roi = _roi;
-                        }
+                        auto profile = f.get_profile();
+                        auto stream_type = profile.stream_type();
+                        auto stream_format = profile.format();
 
-                        _ground_truth_copy = get_ground_truth(); // Copy the mutable GT into a "safe" copy variable
-                        auto gt_ptr = _use_gt ? &_ground_truth_copy : nullptr; // Borrow copy ptr to the callback
-                        auto metrics = analyze_depth_image(depth_frame, su, baseline, &intrin, roi, gt_ptr, callback);
-
+                        if ((RS2_STREAM_DEPTH == stream_type) && (RS2_FORMAT_Z16 == stream_format))
                         {
-                            std::lock_guard<std::mutex> lock(_m);
-                            _latest_metrics = metrics;
+                            float su = 0, baseline = -1.f;
+                            rs2_intrinsics intrin{};
+                            int gt_mm{};
+                            bool plane_fit_set{};
+                            region_of_interest roi{};
+                            {
+                                std::lock_guard<std::mutex> lock(_m);
+                                su = _depth_scale_units;
+                                baseline = _stereo_baseline_mm;
+                                auto depth_profile = profile.as<video_stream_profile>();
+                                intrin = depth_profile.get_intrinsics();
+                                _depth_intrinsic = intrin;
+                                _roi = { int(intrin.width * (0.5f - 0.5f*this->_roi_percentage)),
+                                    int(intrin.height * (0.5f - 0.5f*this->_roi_percentage)),
+                                    int(intrin.width * (0.5f + 0.5f*this->_roi_percentage)),
+                                    int(intrin.height * (0.5f + 0.5f*this->_roi_percentage)) };
+
+                                roi = _roi;
+                            }
+
+                            std::tie(gt_mm, plane_fit_set) = get_inputs();
+
+                            auto metrics = analyze_depth_image(f, su, baseline, &intrin, roi, gt_mm, plane_fit_set, sample, _recorder.is_recording(), callback);
+
+                            {
+                                std::lock_guard<std::mutex> lock(_m);
+                                _latest_metrics = metrics;
+                            }
                         }
                     }
+                    if (_recorder.is_recording())
+                        _recorder.add_sample(frames, std::move(sample));
 
                     // Artificially slow down the calculation, so even on small ROIs / resolutions
                     // the output is updated within reasonable interval (keeping it human readable)
@@ -886,12 +980,13 @@ namespace rs2
         }
 
         std::shared_ptr<metric_plot> tool_model::make_metric(
-            const std::string& name, float min, float max,
+            const std::string& name, float min, float max, const bool requires_plane_fit,
             const std::string& units,
             const std::string& description)
         {
-            auto res = std::make_shared<metric_plot>(name, min, max, units, description);
+            auto res = std::make_shared<metric_plot>(name, min, max, units, description, requires_plane_fit);
             _metrics_model.add_metric(res);
+            _metrics_model._recorder.add_metric({ name,units });
             return res;
         }
 
@@ -933,7 +1028,7 @@ namespace rs2
         {
             std::lock_guard<std::mutex> lock(_m);
 
-            if (!_visible) return;
+            if (!_persistent_visibility.eval()) return;
 
             std::stringstream ss;
             auto val = _vals[(SIZE + _idx - 1) % SIZE];
@@ -1018,7 +1113,7 @@ namespace rs2
                     _description.size() + 1, desc_size, ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_ReadOnly);
                 ImGui::PopStyleColor(3);
 
-                ImGui::PlotLines(_id.c_str(), (float*)&_vals, SIZE, _idx, ss.str().c_str(), _min, _max, { 270, 50 });
+                ImGui::PlotLines(_id.c_str(), (float*)&_vals, int(SIZE), int(_idx), ss.str().c_str(), _min, _max, { 270, 50 });
 
                 ImGui::TreePop();
             }
@@ -1027,6 +1122,7 @@ namespace rs2
             ImGui::PopStyleColor(3);
         }
 
+        // Display the latest metrics in the panel view
         void metrics_model::render(ux_window& win)
         {
             for (auto&& plot : _plots)
@@ -1035,36 +1131,117 @@ namespace rs2
             }
         }
 
-        void metrics_model::serialize_to_csv(const std::string& filename, const std::string& camera_info) const
+        void metrics_recorder::serialize_to_csv() const
         {
-            // RAII
             std::ofstream csv;
 
-            csv.open(filename);
+            csv.open(_filename_base + "_depth_metrics.csv");
 
             // Store the device info and the streaming profile details
-            csv << camera_info;
+            csv << _metrics->_camera_info;
 
-            // Create header line
-            csv << "\nSample Id,Timestamp (ms),";
-            for (auto&& plot : _plots)
+            //Store metric environment
+            csv << "\nEnvironment:\nPlane-Fit_distance_mm," << (_metrics->_plane_fit ? std::to_string(_metrics->_latest_metrics.distance) : "N/A") << std::endl;
+            csv << "Ground-Truth_Distance_mm," << (_metrics->_use_gt ? std::to_string(_metrics->_ground_truth_mm ) : "N/A") << std::endl;
+
+            // Generate columns header
+            csv << "\nSample Id,Frame #,Timestamp (ms),";
+            for (auto&& matric : _metric_data)
             {
-                csv << plot->_name << " " << plot->_units << ",";
+                csv << matric.name << " " << matric.units << ",";
             }
             csv << std::endl;
 
-            // Populate the metrics data
-            for (size_t i = _plots[0]->_first_idx, rec = 0; i != _plots[0]->_idx; i = (++i) % metric_plot::SIZE)
+            //// Populate metrics data using the fill-rate persistent metric as pivot
+            auto i = 0;
+            for (auto&& it: _samples)
             {
-                csv << ++rec << "," << std::fixed << std::setprecision(4) << _plots[0]->_timestamps[i] << ",";
-                for (auto&& plot : _plots)
+                csv << i++ << ","<< it.frame_number << "," << std::fixed << std::setprecision(4) << it.timestamp << ",";
+                for (auto&& matric : _metric_data)
                 {
-                    csv << plot->_vals[i] << ",";
+                    auto samp = std::find_if(it.samples.begin(), it.samples.end(), [&](single_metric_data s) {return s.name == matric.name; });
+                    if(samp != it.samples.end())  csv << samp->val << ",";
                 }
                 csv << std::endl;
             }
 
             csv.close();
         }
-    }
-}
+
+        void metrics_recorder::record_frames(const frameset& frames)
+        {
+            // Trim the file extension when provided. Note that this may amend user-provided file name in case it uses the "." character, e.g. "my.file.name"
+            auto filename_base = _filename_base;
+
+            auto loc = filename_base.find_last_of(".");
+            if (loc != std::string::npos)
+                filename_base.erase(loc, std::string::npos);
+
+            std::stringstream fn;
+            fn << frames.get_frame_number();
+
+            for (auto&& frame : frames)
+            {
+
+                // Snapshot the color-augmented version of the frame
+                if (auto df = frame.as<depth_frame>())
+                {
+                    if (auto colorized_frame = _colorize.colorize(frame).as<video_frame>())
+                    {
+
+                        auto stream_desc = rs2_stream_to_string(colorized_frame.get_profile().stream_type());
+                        auto filename_png = filename_base + "_" + stream_desc + "_" + fn.str() + ".png";
+                        save_to_png(filename_png.data(), colorized_frame.get_width(), colorized_frame.get_height(), colorized_frame.get_bytes_per_pixel(),
+                            colorized_frame.get_data(), colorized_frame.get_width() * colorized_frame.get_bytes_per_pixel());
+
+                    }
+                }
+                auto original_frame = frame.as<video_frame>();
+
+                // For Depth-originated streams also provide a copy of the raw data accompanied by sensor-specific metadata
+                if (original_frame && val_in_range(original_frame.get_profile().stream_type(), { RS2_STREAM_DEPTH , RS2_STREAM_INFRARED }))
+                {
+                    auto stream_desc = rs2_stream_to_string(original_frame.get_profile().stream_type());
+
+                    //Capture raw frame
+                    auto filename = filename_base + "_" + stream_desc + "_" + fn.str() + ".raw";
+                    if (!save_frame_raw_data(filename, original_frame))
+                        _viewer_model.not_model.add_notification(notification_data{ to_string() << "Failed to save frame raw data  " << filename,
+                            RS2_LOG_SEVERITY_INFO, RS2_NOTIFICATION_CATEGORY_UNKNOWN_ERROR });
+
+
+                    // And the frame's attributes
+                    filename = filename_base + "_" + stream_desc + "_" + fn.str() + "_metadata.csv";
+                    if (!frame_metadata_to_csv(filename, original_frame))
+                        _viewer_model.not_model.add_notification(notification_data{ to_string() << "Failed to save frame metadata file " << filename,
+                            RS2_LOG_SEVERITY_INFO, RS2_NOTIFICATION_CATEGORY_UNKNOWN_ERROR });
+
+                }
+            }
+            // Export 3d view in PLY format
+            rs2::frame ply_texture;
+
+            if (_viewer_model.selected_tex_source_uid >= 0)
+            {
+                for (auto&& frame : frames)
+                {
+                    if (frame.get_profile().unique_id() == _viewer_model.selected_tex_source_uid)
+                    {
+                        ply_texture = frame;
+                        _pc.map_to(ply_texture);
+                        break;
+                    }
+                }
+
+                if (ply_texture)
+                {
+                    auto fname = filename_base + "_" + fn.str() + "_3d_mesh.ply";
+                    std::unique_ptr<rs2::filter> exporter;
+                    exporter = std::unique_ptr<rs2::filter>(new rs2::save_to_ply(fname));
+                    export_frame(fname, std::move(exporter), _viewer_model.not_model, frames, false);
+                }
+            }
+        }
+
+     }
+ }

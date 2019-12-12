@@ -5,8 +5,9 @@
 #include <core/motion.h>
 #include <core/advanced_mode.h>
 #include "record_device.h"
+#include "l500/l500-depth.h"
 
-using namespace device_serializer;
+using namespace librealsense;
 
 librealsense::record_device::record_device(std::shared_ptr<librealsense::device_interface> device,
                                       std::shared_ptr<librealsense::device_serializer::writer> serializer):
@@ -26,28 +27,25 @@ librealsense::record_device::record_device(std::shared_ptr<librealsense::device_
 
     m_device = device;
     m_ros_writer = serializer;
+    (*m_write_thread)->start(); //Start thread before creating the sensors (since they might write right away)
     m_sensors = create_record_sensors(m_device);
-    (*m_write_thread)->start();
     LOG_DEBUG("Created record_device");
 }
 
-std::vector<std::shared_ptr<record_sensor>> record_device::create_record_sensors(std::shared_ptr<device_interface> device)
+std::vector<std::shared_ptr<librealsense::record_sensor>> librealsense::record_device::create_record_sensors(std::shared_ptr<librealsense::device_interface> device)
 {
-    std::vector<std::shared_ptr<record_sensor>> record_sensors;
+    std::vector<std::shared_ptr<librealsense::record_sensor>> record_sensors;
     for (size_t sensor_index = 0; sensor_index < device->get_sensors_count(); sensor_index++)
     {
         auto& live_sensor = device->get_sensor(sensor_index);
-        auto sensor_frame_handler = [this, sensor_index](frame_holder f, std::function<void(std::string const&)> on_error)
-        {
+        auto recording_sensor = std::make_shared<librealsense::record_sensor>(*this, live_sensor);
+        m_on_notification_token = recording_sensor->on_notification += [this, recording_sensor, sensor_index](const notification& n) { write_notification(sensor_index, n); };
+        auto on_error = [recording_sensor](const std::string& s) {recording_sensor->stop_with_error(s); };
+        m_on_frame_token = recording_sensor->on_frame += [this, recording_sensor, sensor_index, on_error](frame_holder f) { 
             write_data(sensor_index, std::move(f), on_error);
         };
-
-        auto sensor_snapshot_changes_handler = [this, sensor_index](rs2_extension ext, const std::shared_ptr<extension_snapshot>& snapshot, std::function<void(std::string const&)> on_error)
-        {
-            write_sensor_extension_snapshot(sensor_index, ext, snapshot, on_error);
-        };
-
-        auto recording_sensor = std::make_shared<record_sensor>(*this, live_sensor, sensor_frame_handler, sensor_snapshot_changes_handler);
+        m_on_extension_change_token = recording_sensor->on_extension_change += [this, recording_sensor, sensor_index, on_error](rs2_extension ext, std::shared_ptr<extension_snapshot> snapshot) { write_sensor_extension_snapshot(sensor_index, ext, snapshot, on_error); };
+        recording_sensor->init(); //Calling init AFTER register to the above events
         record_sensors.emplace_back(recording_sensor);
     }
     return record_sensors;
@@ -55,11 +53,21 @@ std::vector<std::shared_ptr<record_sensor>> record_device::create_record_sensors
 
 librealsense::record_device::~record_device()
 {
-    if((*m_write_thread)->flush() == false)
+    for (auto&& s : m_sensors)
+    {
+        s->on_notification -= m_on_notification_token;
+        s->on_frame -= m_on_frame_token;
+        s->on_extension_change -= m_on_extension_change_token;
+        s->disable_recording();
+    }
+    if ((*m_write_thread)->flush() == false)
     {
         LOG_ERROR("Error - timeout waiting for flush, possible deadlock detected");
     }
     (*m_write_thread)->stop();
+    //Just in case someone still holds a reference to the sensors,
+    // we make sure that they will not try to record anything
+    m_sensors.clear();
 }
 
 std::shared_ptr<context> librealsense::record_device::get_context() const
@@ -79,11 +87,10 @@ size_t librealsense::record_device::get_sensors_count() const
 
 void librealsense::record_device::write_header()
 {
-
     auto device_extensions_md = get_extensions_snapshots(m_device.get());
     LOG_DEBUG("Created device snapshot with " << device_extensions_md.get_snapshots().size() << " snapshots");
 
-    std::vector<sensor_snapshot> sensors_snapshot;
+    std::vector<device_serializer::sensor_snapshot> sensors_snapshot;
     for (size_t j = 0; j < m_device->get_sensors_count(); ++j)
     {
         auto& sensor = m_device->get_sensor(j);
@@ -166,13 +173,11 @@ void librealsense::record_device::write_data(size_t sensor_index, librealsense::
 
 const std::string& librealsense::record_device::get_info(rs2_camera_info info) const
 {
-    //info has no setter, it does not change - nothing to record
     return m_device->get_info(info);
 }
 
 bool librealsense::record_device::supports_info(rs2_camera_info info) const
 {
-    //info has no setter, it does not change - nothing to record
     return m_device->supports_info(info);
 }
 
@@ -186,9 +191,10 @@ void librealsense::record_device::hardware_reset()
 }
 
 template <typename T, typename Ext>
-void librealsense::record_device::try_add_snapshot(T* extendable, snapshot_collection& snapshots)
+void librealsense::record_device::try_add_snapshot(T* extendable, device_serializer::snapshot_collection& snapshots)
 {
-    auto api = dynamic_cast<Ext*>(extendable);
+    auto api = dynamic_cast<recordable<Ext>*>(extendable);
+
     if (api != nullptr)
     {
         std::shared_ptr<Ext> p;
@@ -220,23 +226,25 @@ void librealsense::record_device::try_add_snapshot(T* extendable, snapshot_colle
  * @return
  */
 template<typename T>
-snapshot_collection librealsense::record_device::get_extensions_snapshots(T* extendable)
+device_serializer::snapshot_collection librealsense::record_device::get_extensions_snapshots(T* extendable)
 {
     //No support for extensions with more than a single type - i.e every extension has exactly one type in rs2_extension
-    snapshot_collection snapshots;
+    device_serializer::snapshot_collection snapshots;
     for (int i = 0; i < static_cast<int>(RS2_EXTENSION_COUNT ); ++i)
     {
         rs2_extension ext = static_cast<rs2_extension>(i);
         switch (ext)
         {
-            case RS2_EXTENSION_DEBUG           : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_DEBUG          >::type>(extendable, snapshots);
-            case RS2_EXTENSION_INFO            : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_INFO           >::type>(extendable, snapshots);
-            case RS2_EXTENSION_OPTIONS         : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_OPTIONS        >::type>(extendable, snapshots);
-            //case RS2_EXTENSION_MOTION          : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_MOTION         >::type>(extendable, snapshots);
-            //case RS2_EXTENSION_VIDEO           : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_VIDEO          >::type>(extendable, snapshots);
-            //case RS2_EXTENSION_ROI             : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_ROI            >::type>(extendable, snapshots);
-            case RS2_EXTENSION_DEPTH_SENSOR    : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_DEPTH_SENSOR   >::type>(extendable, snapshots);
-            //case RS2_EXTENSION_ADVANCED_MODE   : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_ADVANCED_MODE  >::type>(extendable, snapshots);
+            case RS2_EXTENSION_DEBUG           : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_DEBUG          >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_INFO            : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_INFO           >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_OPTIONS         : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_OPTIONS        >::type>(extendable, snapshots); break;
+            //case RS2_EXTENSION_VIDEO           : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_VIDEO          >::type>(extendable, snapshots); break;
+            //case RS2_EXTENSION_ROI             : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_ROI            >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_DEPTH_SENSOR    : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_DEPTH_SENSOR   >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_L500_DEPTH_SENSOR : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_L500_DEPTH_SENSOR   >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_DEPTH_STEREO_SENSOR: try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_DEPTH_STEREO_SENSOR   >::type>(extendable, snapshots); break;
+            //case RS2_EXTENSION_ADVANCED_MODE   : try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_ADVANCED_MODE  >::type>(extendable, snapshots); break;
+            case RS2_EXTENSION_RECOMMENDED_FILTERS: try_add_snapshot<T, ExtensionToType<RS2_EXTENSION_RECOMMENDED_FILTERS   >::type>(extendable, snapshots); break;
             case RS2_EXTENSION_VIDEO_FRAME     : break;
             case RS2_EXTENSION_MOTION_FRAME    : break;
             case RS2_EXTENSION_COMPOSITE_FRAME : break;
@@ -246,7 +254,7 @@ snapshot_collection librealsense::record_device::get_extensions_snapshots(T* ext
             case RS2_EXTENSION_COUNT           : break;
             case RS2_EXTENSION_UNKNOWN         : break;
             default:
-                LOG_WARNING("Extensions type is unhandled: " << ext);
+                LOG_WARNING("Extensions type is unhandled: " << get_string(ext));
         }
     }
     return snapshots;
@@ -280,7 +288,7 @@ void librealsense::record_device::write_device_extension_changes(const T& ext)
 
 void record_device::write_sensor_extension_snapshot(size_t sensor_index,
     rs2_extension ext,
-    const std::shared_ptr<extension_snapshot>& snapshot,
+    std::shared_ptr<extension_snapshot> snapshot,
     std::function<void(std::string const&)> on_error)
 {
     auto capture_time = get_capture_time();
@@ -298,6 +306,24 @@ void record_device::write_sensor_extension_snapshot(size_t sensor_index,
     });
 }
 
+void librealsense::record_device::write_notification(size_t sensor_index, const notification& n)
+{
+    auto capture_time = get_capture_time();
+    (*m_write_thread)->invoke([this, sensor_index, capture_time, n](dispatcher::cancellable_timer t)
+    {
+        try
+        {
+            const uint32_t device_index = 0;
+            m_ros_writer->write_notification({ device_index, static_cast<uint32_t>(sensor_index) }, capture_time, n);
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERROR(e.what());
+        }
+    });
+
+}
+
 template <rs2_extension E, typename P>
 bool librealsense::record_device::extend_to_aux(std::shared_ptr<P> p, void** ext)
 {
@@ -313,7 +339,7 @@ bool librealsense::record_device::extend_to_aux(std::shared_ptr<P> p, void** ext
         });
     }
 
-    *ext = &ptr;
+    *ext = ptr.get();
     return true;
 }
 
@@ -333,21 +359,11 @@ bool librealsense::record_device::extend_to(rs2_extension extension_type, void**
         *ext = this;
         return true;
     case RS2_EXTENSION_OPTIONS         : return extend_to_aux<RS2_EXTENSION_OPTIONS        >(m_device, ext);
+    case RS2_EXTENSION_ADVANCED_MODE   : return extend_to_aux<RS2_EXTENSION_ADVANCED_MODE  >(m_device, ext);
     case RS2_EXTENSION_DEBUG           : return extend_to_aux<RS2_EXTENSION_DEBUG          >(m_device, ext);
-    //TODO: Add once implements recordable: case RS2_EXTENSION_MOTION          : return extend_to_aux<RS2_EXTENSION_MOTION         >(m_device, ext);
-    //case RS2_EXTENSION_VIDEO           : return extend_to_aux<RS2_EXTENSION_VIDEO          >(m_device, ext);
-    //case RS2_EXTENSION_ROI             : return extend_to_aux<RS2_EXTENSION_ROI            >(m_device, ext);
-    //case RS2_EXTENSION_DEPTH_SENSOR    : return extend_to_aux<RS2_EXTENSION_DEPTH_SENSOR   >(m_device, ext);
-    //case RS2_EXTENSION_VIDEO_FRAME     : return extend_to_aux<RS2_EXTENSION_VIDEO_FRAME    >(m_device, ext);
-    //TODO: Add once interface created: case RS2_EXTENSION_MOTION_FRAME    : return extend_to_aux<RS2_EXTENSION_MOTION_FRAME   >(m_device, ext);
-    //case RS2_EXTENSION_COMPOSITE_FRAME : return extend_to_aux<RS2_EXTENSION_COMPOSITE_FRAME>(m_device, ext);
-    //case RS2_EXTENSION_POINTS          : return extend_to_aux<RS2_EXTENSION_POINTS         >(m_device, ext);
-    //case RS2_EXTENSION_DEPTH_FRAME     : return extend_to_aux<RS2_EXTENSION_DEPTH_FRAME    >(m_device, ext);
-    //case RS2_EXTENSION_ADVANCED_MODE   : return extend_to_aux<RS2_EXTENSION_ADVANCED_MODE  >(m_device, ext);
-    //case RS2_EXTENSION_VIDEO_PROFILE   : return extend_to_aux<RS2_EXTENSION_VIDEO_PROFILE  >(m_device, ext);
-    //case RS2_EXTENSION_PLAYBACK        : return extend_to_aux<RS2_EXTENSION_PLAYBACK       >(m_device, ext);
+    //Other cases are not extensions that we expect a device to have.
     default:
-        LOG_WARNING("Extensions type is unhandled: " << extension_type);
+        LOG_WARNING("Extensions type is unhandled: " << get_string(extension_type));
         return false;
     }
 }
@@ -386,6 +402,11 @@ void librealsense::record_device::resume_recording()
         LOG_DEBUG("Total pause time: " << m_record_pause_time.count());
         LOG_INFO("Record resumed");
     });
+}
+
+const std::string& librealsense::record_device::get_filename() const
+{
+    return m_ros_writer->get_file_name();
 }
 platform::backend_device_group record_device::get_device_data() const
 {

@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 2.8.9)
+
 project(realsense-file)
 
 include(config.cmake)
@@ -10,12 +11,6 @@ FILE(GLOB_RECURSE AllSources
         ${ROSBAG_DIR}/*.h
         ${ROSBAG_DIR}/*.cpp
         ${ROSBAG_DIR}/*.c
-        )
-
-include_directories(
-        ${ROSBAG_HEADER_DIRS}
-        ${BOOST_INCLUDE_PATH}
-        ${LZ4_INCLUDE_PATH}
         )
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
@@ -37,12 +32,13 @@ add_library(${PROJECT_NAME} STATIC
     ${SOURCE_FILES_COMPRESSION}
 )
 
-#set_target_properties(${PROJECT_NAME} PROPERTIES VERSION "${LIBVERSION}" SOVERSION "${LIBSOVERSION}")
+target_include_directories(${PROJECT_NAME} PRIVATE
+        ${ROSBAG_HEADER_DIRS}
+        ${BOOST_INCLUDE_PATH}
+        ${LZ4_INCLUDE_PATH}
+        )
 
-target_link_libraries(${PROJECT_NAME}
-#  ${Boost_SYSTEM_LIBRARY}
-#  liblz4_x64
-)
+#set_target_properties(${PROJECT_NAME} PROPERTIES VERSION "${LIBVERSION}" SOVERSION "${LIBSOVERSION}")
 
 set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER Library)
 

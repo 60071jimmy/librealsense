@@ -4,33 +4,49 @@
 
 // Purpose: build native librealsense
 
-const {exec} = require('child_process');
+const {spawn} = require('child_process');
 const os = require('os');
 
 function buildNativeLib() {
   console.log('Building librealsense C++ API. It takes time...');
-
-  if (os.type() == 'Windows_NT') {
+  const type = os.type();
+  if (type === 'Windows_NT') {
     buildNativeLibWindows();
-  } else {
+  } else if (type === 'Linux') {
     buildNativeLibLinux();
+  } else if (type === 'Darwin') {
+    buildNativeLibMac();
+  } else {
+    throw new TypeError('Not supported build platform!');
   }
 }
 
+function buildNativeLibMac() {
+  let child = spawn('./scripts/npm_dist/build-dist-mac.sh');
+  child.stderr.on('data', (data) => {
+    console.error(`${data}`);
+  });
+  child.stdout.on('data', (data) => {
+    console.log(`${data}`);
+  });
+  child.on('close', (code) => {
+    if (code) {
+      throw new Error(`Failed to build librealsense, build-dist-mac.sh exited with code ${code}`);
+    }
+  });
+}
+
 function buildNativeLibLinux() {
-  exec('./scripts/npm_dist/build-dist.sh',
-       (error, stdout, stderr) => {
-    if (error) {
-      console.log('Failed to build librealsense, error:', error);
-      throw error;
-    }
-
-    if (stdout) {
-      process.stdout.write(stdout);
-    }
-
-    if (stderr) {
-      process.stderr.write(stderr);
+  let child = spawn('./scripts/npm_dist/build-dist.sh');
+  child.stderr.on('data', (data) => {
+    console.error(`${data}`);
+  });
+  child.stdout.on('data', (data) => {
+    console.log(`${data}`);
+  });
+  child.on('close', (code) => {
+    if (code) {
+      throw new Error(`Failed to build librealsense, build-dist.sh exited with code ${code}`);
     }
   });
 }
@@ -38,22 +54,18 @@ function buildNativeLibLinux() {
 function buildNativeLibWindows() {
   const cmakeGenPlatform = process.arch;
   const msBuildPlatform = process.arch=='ia32'?'Win32':process.arch;
-
-  exec('cmd /c .\\scripts\\npm_dist\\build-dist.bat ' + cmakeGenPlatform + ' ' + msBuildPlatform,
-       (error, stdout, stderr) => {
-    if (error) {
-      console.log('Failed to build librealsense, error:', error);
-      throw error;
-    }
-
-    if (stdout) {
-      process.stdout.write(stdout);
-    }
-
-    if (stderr) {
-      process.stderr.write(stderr);
+  let child = spawn('cmd', ['/c', '.\\scripts\\npm_dist\\build-dist.bat', cmakeGenPlatform,
+      msBuildPlatform]);
+  child.stderr.on('data', (data) => {
+    console.error(`${data}`);
+  });
+  child.stdout.on('data', (data) => {
+    console.log(`${data}`);
+  });
+  child.on('close', (code) => {
+    if (code) {
+      throw new Error(`Failed to build librealsense, build-dist.bat exited with code ${code}`);
     }
   });
 }
-
 buildNativeLib();

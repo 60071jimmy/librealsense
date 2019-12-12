@@ -1,15 +1,20 @@
 #pragma once
 
 #define GLFW_INCLUDE_GLU
-
 #include <GLFW/glfw3.h>
+
 #include "imgui.h"
 #include <string>
 #include <functional>
+#include <thread>
 #include "rendering.h"
+#include <atomic>
+#include <memory>
 
 namespace rs2
 {
+    class visualizer_2d;
+
     class viewer_ui_traits
     {
     public:
@@ -42,7 +47,7 @@ namespace rs2
 
         ~ux_window();
 
-        operator GLFWwindow*() { return _win; }
+        operator GLFWwindow*() const { return _win; }
 
         void begin_frame();
 
@@ -60,7 +65,23 @@ namespace rs2
 
         void add_on_load_message(const std::string& msg);
 
+        bool is_ui_aligned() { return _is_ui_aligned; }
+        bool is_fullscreen() { return _fullscreen; }
+
+        texture_buffer& get_splash() { return _splash_tex; }
+
+        void reload();
+        void refresh();
+
+        void link_hovered();
     private:
+        void open_window();
+
+        void setup_icon();
+
+        void imgui_config_push();
+        void imgui_config_pop();
+
         GLFWwindow               *_win;
         int                      _width, _height, _output_height;
         int                     _fb_width, _fb_height;
@@ -71,8 +92,10 @@ namespace rs2
         std::string              _error_message;
         float                    _scale_factor;
 
+        std::thread              _first_load;
         bool                     _first_frame;
         std::atomic<bool>        _app_ready;
+        std::atomic<bool>        _keep_alive;
         texture_buffer           _splash_tex;
         timer                    _splash_timer;
         std::string              _title_str;
@@ -83,5 +106,22 @@ namespace rs2
         bool                     _missing_device = false;
         int                      _hourglass_index = 0;
         std::string              _dev_stat_message;
+        bool                     _fullscreen_pressed = false;
+        bool                     _fullscreen = false;
+        bool                     _reload = false;
+        bool                     _show_fps = false;
+        bool                     _vsync = true;
+        bool                     _use_glsl_proc = false;
+        bool                     _use_glsl_render = false;
+        bool                     _enable_msaa = false;
+        int                      _msaa_samples = 0;
+
+        bool                     _link_hovered = false;
+        GLFWcursor*              _hand_cursor = nullptr;
+
+        std::string              _title;
+        std::shared_ptr<visualizer_2d> _2d_vis;
+
+        bool                     _is_ui_aligned = false;
     };
 }
